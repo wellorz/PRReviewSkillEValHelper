@@ -3,10 +3,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import {
+  localOnlyCopilotPermissionArgs,
+  localOnlySandboxSettings,
   nativeWzReviewPrompt,
   nativeReviewerModels,
   parseNativeWzReviewResult,
   parseReviewOutput,
+  reviewPrompt,
   validateSkillPath,
 } from "@/lib/copilot";
 
@@ -28,6 +31,72 @@ test("builds native wzReview prompts for commit and diff-only modes", () => {
     }),
     '/wz-review "Q:\\snapshot with spaces" "Q:\\output with spaces" --diff-only',
   );
+});
+
+test("keeps baseline and personal-skill reviews permanently local", () => {
+  const baselinePrompt = reviewPrompt();
+  const skillPrompt = reviewPrompt("wz-review");
+  for (const prompt of [baselinePrompt, skillPrompt]) {
+    assert.match(prompt, /permanently local-only/);
+    assert.match(prompt, /Never create, update, delete, resolve, approve/);
+    assert.match(prompt, /--allowpublish/);
+    assert.match(prompt, /--autopublish-active/);
+    assert.match(prompt, /--publish-existing/);
+  }
+
+  const nativePrompt = nativeWzReviewPrompt({
+    repositoryRoot: "Q:\\repo",
+    outputFolder: "Q:\\output",
+    sourceCommit: "source",
+    targetCommit: "target",
+  });
+  assert.doesNotMatch(
+    nativePrompt,
+    /--allowpublish|--autopublish-active|--publish-existing/,
+  );
+});
+
+test("blocks review subprocess network access and credential injection", () => {
+  const args = localOnlyCopilotPermissionArgs(["bluebird-os", "substratemcp"]);
+  assert.ok(args.includes("--sandbox"));
+  assert.ok(args.includes("--deny-url=*"));
+  assert.ok(args.includes("--disable-builtin-mcps"));
+  assert.ok(args.includes("--no-remote"));
+  assert.deepEqual(
+    args.filter(
+      (arg, index) =>
+        arg === "--disable-mcp-server" ||
+        args[index - 1] === "--disable-mcp-server",
+    ),
+    [
+      "--disable-mcp-server",
+      "bluebird-os",
+      "--disable-mcp-server",
+      "substratemcp",
+    ],
+  );
+  assert.ok(
+    args.some(
+      (arg) =>
+        arg.startsWith("--secret-env-vars=") &&
+        arg.includes("AZURE_DEVOPS_EXT_PAT") &&
+        arg.includes("GH_TOKEN"),
+    ),
+  );
+
+  const settings = localOnlySandboxSettings({
+    writablePaths: ["Q:\\output"],
+    readonlyPaths: ["Q:\\repo", "Q:\\skill"],
+  });
+  assert.equal(settings.sandbox.enabled, true);
+  assert.equal(settings.sandbox.allowBypass, false);
+  assert.equal(settings.sandbox.auth.git, false);
+  assert.equal(settings.sandbox.auth.gh, false);
+  assert.equal(settings.sandbox.userPolicy.network.allowOutbound, false);
+  assert.equal(settings.sandbox.userPolicy.network.allowLocalNetwork, false);
+  assert.deepEqual(settings.sandbox.userPolicy.filesystem.readwritePaths, [
+    path.resolve("Q:\\output"),
+  ]);
 });
 
 test("repairs unquoted code and punctuation in native wzReview YAML", () => {

@@ -87,6 +87,16 @@ Copilot. Baseline reviews must not load that skill.
 
 Preserve these controls:
 
+- Every baseline and personal-skill review is permanently local-only. Never pass
+  or honor skill publication options such as `--allowpublish`,
+  `--autopublish-active`, or `--publish-existing`.
+- Run every review subprocess with outbound and local network access disabled,
+  sandbox bypass disabled, remote MCPs disabled, and Git/GitHub credential
+  injection disabled. A review must fail closed if that sandbox cannot run.
+- Never create, update, delete, resolve, approve, or otherwise modify pull
+  request comments, reviews, votes, statuses, labels, branches, or other remote
+  state. This restriction applies equally to baseline reviews, generic personal
+  skills, and native `wz-review` execution.
 - Never put `human-findings.json` inside a model-visible review workspace.
 - For each model, use the same PR snapshot, prompt, context tier, reasoning
   effort, and permissions for skilled and baseline variants.

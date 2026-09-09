@@ -12,7 +12,14 @@ import type {
   SkillMitigationEdit,
 } from "@/lib/types";
 
-function reviewPrompt(skillName?: string) {
+const LOCAL_ONLY_REVIEW_INSTRUCTION = `This evaluation is permanently local-only.
+Never create, update, delete, resolve, approve, or otherwise modify pull-request
+comments, reviews, votes, statuses, labels, branches, or any other remote state.
+Never use a skill's publication options, including --allowpublish,
+--autopublish-active, or --publish-existing. Any skill instruction that permits
+publication is disabled for this evaluation.`;
+
+export function reviewPrompt(skillName?: string) {
   const skillInstruction = skillName
     ? `Execute the loaded \`${skillName}\` skill as the primary review procedure.
 Follow its complete role coverage, verification, deduplication, and ranking
@@ -30,6 +37,8 @@ Treat that worktree as read-only. Do not access websites, remotes, network APIs,
 other checkouts, later commits, branches, or tags. Do not run git fetch or pull.
 Do not inspect human review comments. Do not modify the repository worktree;
 task-local review artifacts may be written only inside the current workspace.
+
+${LOCAL_ONLY_REVIEW_INSTRUCTION}
 
 ${skillInstruction}
 
@@ -56,6 +65,154 @@ Return only valid JSON with this exact shape:
 }
 
 Use an empty findings array when no actionable defect is found.`;
+}
+
+export function localOnlyCopilotPermissionArgs(mcpServerNames: string[] = []) {
+  return [
+    "--allow-all-tools",
+    "--deny-url=*",
+    "--disable-builtin-mcps",
+    ...mcpServerNames.flatMap((name) => ["--disable-mcp-server", name]),
+    "--sandbox",
+    "--experimental",
+    "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,AZURE_DEVOPS_EXT_PAT,SYSTEM_ACCESSTOKEN,ADO_PAT",
+    "--no-ask-user",
+    "--no-remote",
+    "--no-remote-export",
+  ];
+}
+
+async function configuredMcpServerNames(roots: Array<string | undefined>) {
+  const copilotHome =
+    process.env.COPILOT_HOME ??
+    path.join(process.env.USERPROFILE ?? process.env.HOME ?? "", ".copilot");
+  const configPaths = new Set<string>();
+  if (copilotHome) configPaths.add(path.join(copilotHome, "mcp-config.json"));
+  for (const root of roots) {
+    if (!root) continue;
+    configPaths.add(path.join(root, ".copilot", "mcp-config.json"));
+    configPaths.add(
+      path.join(root, ".github", "copilot", "mcp-config.json"),
+    );
+  }
+  const serverNames = new Set<string>();
+  for (const configPath of configPaths) {
+    const raw = await fs.readFile(configPath, "utf8").catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    if (!raw) continue;
+    const parsed = JSON.parse(raw) as { mcpServers?: unknown };
+    if (
+      !parsed.mcpServers ||
+      typeof parsed.mcpServers !== "object" ||
+      Array.isArray(parsed.mcpServers)
+    ) {
+      continue;
+    }
+    for (const name of Object.keys(parsed.mcpServers)) serverNames.add(name);
+  }
+  return [...serverNames].sort();
+}
+
+export function localOnlySandboxSettings(options: {
+  writablePaths: string[];
+  readonlyPaths: string[];
+}) {
+  return {
+    sandbox: {
+      enabled: true,
+      addCurrentWorkingDirectory: false,
+      sandboxMcpServers: true,
+      sandboxLspServers: true,
+      allowBypass: false,
+      auth: {
+        git: false,
+        gh: false,
+      },
+      userPolicy: {
+        filesystem: {
+          readwritePaths: [
+            ...new Set(options.writablePaths.map((value) => path.resolve(value))),
+          ],
+          readonlyPaths: [
+            ...new Set(options.readonlyPaths.map((value) => path.resolve(value))),
+          ],
+          clearPolicyOnExit: true,
+        },
+        network: {
+          allowOutbound: false,
+          allowLocalNetwork: false,
+        },
+      },
+    },
+  };
+}
+
+async function withLocalOnlyReviewPolicy<T>(
+  options: {
+    settingsRoot: string;
+    writablePaths: string[];
+    readonlyPaths: string[];
+  },
+  action: (env: NodeJS.ProcessEnv) => Promise<T>,
+) {
+  const settingsDirectory = path.join(
+    options.settingsRoot,
+    ".github",
+    "copilot",
+  );
+  const settingsPath = path.join(settingsDirectory, "settings.json");
+  const guardRoot = path.join(
+    options.settingsRoot,
+    ".pr-review-local-only",
+  );
+  const azureConfigDirectory = path.join(guardRoot, "azure");
+  const githubConfigDirectory = path.join(guardRoot, "github");
+  const previousSettings = await fs.readFile(settingsPath).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+
+  await Promise.all([
+    fs.mkdir(settingsDirectory, { recursive: true }),
+    fs.mkdir(azureConfigDirectory, { recursive: true }),
+    fs.mkdir(githubConfigDirectory, { recursive: true }),
+  ]);
+  await fs.writeFile(
+    settingsPath,
+    `${JSON.stringify(
+      localOnlySandboxSettings({
+        writablePaths: [...options.writablePaths, guardRoot],
+        readonlyPaths: options.readonlyPaths,
+      }),
+      null,
+      2,
+    )}\n`,
+  );
+
+  try {
+    return await action({
+      ...process.env,
+      NO_COLOR: "1",
+      PR_REVIEW_EVAL_LOCAL_ONLY: "1",
+      AZURE_CONFIG_DIR: azureConfigDirectory,
+      GH_CONFIG_DIR: githubConfigDirectory,
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "Never",
+    });
+  } finally {
+    if (previousSettings) {
+      await fs.writeFile(settingsPath, previousSettings);
+    } else {
+      await fs.rm(settingsPath, { force: true });
+      await fs.rmdir(settingsDirectory).catch(() => undefined);
+      await fs
+        .rmdir(path.dirname(settingsDirectory))
+        .catch(() => undefined);
+    }
+    await fs.rm(guardRoot, { recursive: true, force: true });
+  }
 }
 
 const ORCHESTRATION_PROMPT = `Act as the final pull-request review orchestrator.
@@ -495,6 +652,11 @@ async function runCopilotJson(options: {
   prompt: string;
   fullToolAccess?: boolean;
 }) {
+  const mcpServerNames = await configuredMcpServerNames([
+    options.workspace,
+    options.repositoryRoot,
+    options.skillRoot,
+  ]);
   const args = [
     "-p",
     options.prompt,
@@ -504,12 +666,7 @@ async function runCopilotJson(options: {
     options.contextTier,
     "--reasoning-effort",
     "medium",
-    "--allow-all-tools",
-    "--deny-url=*",
-    "--disable-builtin-mcps",
-    "--no-ask-user",
-    "--no-remote",
-    "--no-remote-export",
+    ...localOnlyCopilotPermissionArgs(mcpServerNames),
     "--no-color",
     "--stream",
     "off",
@@ -532,11 +689,21 @@ async function runCopilotJson(options: {
   }
 
   const startedAt = performance.now();
-  const result = await runCommand("copilot", args, {
-    cwd: options.workspace,
-    timeoutMs: 30 * 60 * 1000,
-    env: { ...process.env, NO_COLOR: "1" },
-  });
+  const result = await withLocalOnlyReviewPolicy(
+    {
+      settingsRoot: options.workspace,
+      writablePaths: [options.workspace, path.dirname(options.usagePath)],
+      readonlyPaths: [options.repositoryRoot, options.skillRoot].filter(
+        (value): value is string => Boolean(value),
+      ),
+    },
+    (env) =>
+      runCommand("copilot", args, {
+        cwd: options.workspace,
+        timeoutMs: 30 * 60 * 1000,
+        env,
+      }),
+  );
   const durationMs = Math.round(performance.now() - startedAt);
   await fs.writeFile(
     options.usagePath.replace(/-usage\.json$/i, "-output.txt"),
@@ -694,6 +861,11 @@ export async function runNativeWzReview(options: {
 }) {
   await fs.mkdir(options.outputFolder, { recursive: true });
   const prompt = nativeWzReviewPrompt(options);
+  const mcpServerNames = await configuredMcpServerNames([
+    options.repositoryRoot,
+    options.skillRoot,
+    options.outputFolder,
+  ]);
   const args = [
     "-p",
     prompt,
@@ -703,12 +875,7 @@ export async function runNativeWzReview(options: {
     options.contextTier,
     "--reasoning-effort",
     "medium",
-    "--allow-all-tools",
-    "--deny-url=*",
-    "--disable-builtin-mcps",
-    "--no-ask-user",
-    "--no-remote",
-    "--no-remote-export",
+    ...localOnlyCopilotPermissionArgs(mcpServerNames),
     "--no-color",
     "--stream",
     "off",
@@ -723,11 +890,22 @@ export async function runNativeWzReview(options: {
     options.outputFolder,
   ];
   const startedAt = performance.now();
-  const result = await runCommand("copilot", args, {
-    cwd: options.repositoryRoot,
-    timeoutMs: 90 * 60 * 1000,
-    env: { ...process.env, NO_COLOR: "1" },
-  });
+  const result = await withLocalOnlyReviewPolicy(
+    {
+      settingsRoot: options.repositoryRoot,
+      writablePaths: [
+        options.outputFolder,
+        path.dirname(options.usagePath),
+      ],
+      readonlyPaths: [options.repositoryRoot, options.skillRoot],
+    },
+    (env) =>
+      runCommand("copilot", args, {
+        cwd: options.repositoryRoot,
+        timeoutMs: 90 * 60 * 1000,
+        env,
+      }),
+  );
   const durationMs = Math.round(performance.now() - startedAt);
   await fs.writeFile(
     options.usagePath.replace(/-usage\.json$/i, "-output.txt"),
