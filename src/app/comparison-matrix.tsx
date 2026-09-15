@@ -1,6 +1,11 @@
+"use client";
+
 import Link from "next/link";
+import { useMemo, useState } from "react";
 import {
   comparisonState,
+  sortComparisonRowsByScore,
+  type ComparisonScoreSortDirection,
   type ComparisonMatrixRow,
 } from "@/lib/comparison-matrix";
 
@@ -11,6 +16,19 @@ export function ComparisonMatrix({
   rows: ComparisonMatrixRow[];
   emptyMessage?: string;
 }) {
+  const [scoreSortDirection, setScoreSortDirection] =
+    useState<ComparisonScoreSortDirection | null>(null);
+  const displayedRows = useMemo(
+    () => sortComparisonRowsByScore(rows, scoreSortDirection),
+    [rows, scoreSortDirection],
+  );
+
+  function toggleScoreSort() {
+    setScoreSortDirection((direction) =>
+      direction === "desc" ? "asc" : "desc",
+    );
+  }
+
   return (
     <section className="panel comparisonPanel">
       <div className="panelHeading">
@@ -26,14 +44,31 @@ export function ComparisonMatrix({
             <tr>
               <th>Configuration</th>
               <th>Type</th>
-              <th>Score</th>
+              <th>
+                <span className="sortableHeader">
+                  <span>Score</span>
+                  <button
+                    type="button"
+                    className={`sortHeaderButton${scoreSortDirection ? " active" : ""}`}
+                    aria-label="Sort comparison configurations by score"
+                    title="Sort by score"
+                    onClick={toggleScoreSort}
+                  >
+                    {scoreSortDirection === "desc"
+                      ? "\u2193"
+                      : scoreSortDirection === "asc"
+                        ? "\u2191"
+                        : "\u2195"}
+                  </button>
+                </span>
+              </th>
               <th>Credits</th>
               <th>Completed</th>
               <th>State</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => (
+            {displayedRows.map((row) => (
               <tr key={row.id}>
                 <td>
                   <strong>

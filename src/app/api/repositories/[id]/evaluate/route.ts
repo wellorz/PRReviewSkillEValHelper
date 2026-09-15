@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getDb } from "@/lib/db";
 import { filterPullRequestsByChangedPath } from "@/lib/pr-path-filter";
-import { hasCurrentWorkflowWorkerVersion } from "@/lib/workflow-version";
+import { workerAvailableForRepository } from "@/lib/worker-availability";
 import { queuePersonalSkillResults } from "@/lib/workflow-result-queue";
 
 const schema = z.object({
@@ -26,7 +26,7 @@ export async function POST(
   const repository = db
     .prepare(`
       SELECT baseline_concurrency, model, model_secondary, context_tier
-        , local_repo_path, local_repo_branch
+        , local_repo_path, local_repo_branch, status, updated_at
       FROM repositories WHERE id = ?
     `)
     .get(id) as
@@ -37,6 +37,8 @@ export async function POST(
         context_tier: string;
         local_repo_path: string | null;
         local_repo_branch: string | null;
+        status: string;
+        updated_at: string;
       }
     | undefined;
   if (!repository) {
@@ -90,7 +92,7 @@ export async function POST(
     ? [...new Set(parsed.data.skillIds)]
     : null;
   if (skillIds) {
-    if (!hasCurrentWorkflowWorkerVersion()) {
+    if (!workerAvailableForRepository(repository)) {
       return NextResponse.json(
         {
           error:
@@ -126,7 +128,7 @@ export async function POST(
   const enqueue = db.transaction(() => {
     const result = db
       .prepare(
-        "INSERT INTO workflow_tasks (repository_id, kind, pr_ids_json, payload_json, total_items) VALUES (?, 'skill_eval', ?, ?, ?)",
+        "INSERT INTO workflow_tasks (repository_id, kind, pr_ids_json, payload_json, total_items, status_message) VALUES (?, 'skill_eval', ?, ?, ?, ?)",
       )
       .run(
         id,
@@ -146,6 +148,7 @@ export async function POST(
             : {}),
         }),
         totalItems,
+        "Waiting for worker",
       );
     if (skillIds) {
       queuePersonalSkillResults(db, {

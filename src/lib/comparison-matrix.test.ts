@@ -5,7 +5,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ComparisonMatrix } from "@/app/comparison-matrix";
 import {
   comparisonState,
+  sortComparisonRowsByScore,
   summarizeComparisonResults,
+  type ComparisonMatrixRow,
 } from "@/lib/comparison-matrix";
 
 test("counts only completed credits and preserves every execution state", () => {
@@ -42,6 +44,49 @@ test("handles an empty filtered matrix without a fabricated score", () => {
   assert.equal(comparisonState(summary), "Complete");
 });
 
+test("sorts comparison rows by score with unavailable scores last", () => {
+  const rows: ComparisonMatrixRow[] = [
+    {
+      id: "low",
+      name: "Low",
+      description: "",
+      kind: "baseline",
+      summary: summarizeComparisonResults(
+        [{ status: "completed", earnedPoints: 1 }],
+        4,
+        4,
+      ),
+    },
+    {
+      id: "unavailable",
+      name: "Unavailable",
+      description: "",
+      kind: "personal-skill",
+    },
+    {
+      id: "high",
+      name: "High",
+      description: "",
+      kind: "baseline",
+      summary: summarizeComparisonResults(
+        [{ status: "completed", earnedPoints: 3 }],
+        4,
+        4,
+      ),
+    },
+  ];
+
+  assert.deepEqual(
+    sortComparisonRowsByScore(rows, "desc").map((row) => row.id),
+    ["high", "low", "unavailable"],
+  );
+  assert.deepEqual(
+    sortComparisonRowsByScore(rows, "asc").map((row) => row.id),
+    ["low", "high", "unavailable"],
+  );
+  assert.equal(sortComparisonRowsByScore(rows, null), rows);
+});
+
 test("renders the same six comparison columns for live and saved rows", () => {
   const summary = summarizeComparisonResults(
     Array.from({ length: 7 }, (_, index) => ({
@@ -61,9 +106,13 @@ test("renders the same six comparison columns for live and saved rows", () => {
       href: "/repositories/1/history-reports/15",
     }],
   }));
-  for (const column of ["Configuration", "Type", "Score", "Credits", "Completed", "State"]) {
+  for (const column of ["Configuration", "Type", "Credits", "Completed", "State"]) {
     assert.ok(markup.includes(`<th>${column}</th>`));
   }
+  assert.ok(
+    markup.includes('aria-label="Sort comparison configurations by score"'),
+  );
+  assert.ok(markup.includes("<span>Score</span>"));
   assert.ok(markup.includes('href="/repositories/1/history-reports/15"'));
   assert.ok(markup.includes("GPT-6 ASTRA 1M"));
   assert.ok(markup.includes("<td>42.9</td>"));

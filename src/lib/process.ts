@@ -10,6 +10,22 @@ export type CommandResult = {
   exitCode: number;
 };
 
+function terminateProcessTree(child: ReturnType<typeof spawn>) {
+  if (process.platform === "win32" && child.pid) {
+    const killer = spawn(
+      "taskkill.exe",
+      ["/PID", String(child.pid), "/T", "/F"],
+      {
+        windowsHide: true,
+        stdio: "ignore",
+      },
+    );
+    killer.unref();
+    return;
+  }
+  child.kill("SIGKILL");
+}
+
 export function runCommand(
   command: string,
   args: string[],
@@ -34,7 +50,7 @@ export function runCommand(
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      child.kill();
+      terminateProcessTree(child);
       reject(new WorkflowCancellationError());
     };
 
@@ -43,7 +59,7 @@ export function runCommand(
           if (settled) return;
           settled = true;
           signal?.removeEventListener("abort", abort);
-          child.kill();
+          terminateProcessTree(child);
           reject(new Error(`${command} timed out after ${options.timeoutMs}ms`));
         }, options.timeoutMs)
       : null;

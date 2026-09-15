@@ -7,6 +7,7 @@ import {
   completeDatasetScan,
   normalizedPathFilterKey,
   recordCachedScan,
+  recordScanFailure,
   recordScanOutcome,
   scanScope,
 } from "@/lib/scan-ledger";
@@ -31,6 +32,20 @@ test("checkpoints scans by repository, filter, policy, PR, date, and commit", ()
       '["src/api","src/core"]',
     );
     const scope = scanScope(repository, ["src/api"]);
+    const resolvedScope = scanScope(
+      { ...repository, collection_mode: "resolved_comments" },
+      ["src/api"],
+    );
+    const customConfirmationScope = scanScope(
+      {
+        ...repository,
+        collection_mode: "strict_confirmed",
+        confirmation_words_json: '["confirmed internally"]',
+      },
+      ["src/api"],
+    );
+    assert.notEqual(scope.policyVersion, resolvedScope.policyVersion);
+    assert.notEqual(scope.policyVersion, customConfirmationScope.policyVersion);
     const runId = beginDatasetScan(repository, scope);
     const first = {
       number: 42,
@@ -50,21 +65,28 @@ test("checkpoints scans by repository, filter, policy, PR, date, and commit", ()
       null,
     );
     recordCachedScan(runId, scope, first);
+    recordScanFailure(runId, {
+      number: 43,
+      sourceUpdatedAt: "2026-09-01T01:00:00.000Z",
+      sourceCommit: "b".repeat(40),
+    });
     completeDatasetScan(runId, 0);
     assert.deepEqual(
       db
         .prepare(`
-          SELECT status, scanned_count, skipped_count, newest_pr_number,
-            oldest_pr_number
+          SELECT status, scanned_count, skipped_count, failed_count,
+            failed_prs_json, newest_pr_number, oldest_pr_number
           FROM dataset_scan_runs
           WHERE id = ?
         `)
         .get(runId),
       {
         status: "completed",
-        scanned_count: 1,
+        scanned_count: 2,
         skipped_count: 1,
-        newest_pr_number: 42,
+        failed_count: 1,
+        failed_prs_json: "[43]",
+        newest_pr_number: 43,
         oldest_pr_number: 42,
       },
     );

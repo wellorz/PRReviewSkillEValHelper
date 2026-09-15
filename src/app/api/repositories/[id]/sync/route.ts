@@ -20,9 +20,9 @@ export async function POST(
       { status: 409 },
     );
   }
-  const statusMessage = repositorySyncQueueMessage(repository.id);
+  const statusMessage = repositorySyncQueueMessage();
   db.prepare(
-    "UPDATE repositories SET status = 'queued', status_message = ?, scan_current = 0, scan_total = 0, collected_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE repositories SET status = 'queued', status_message = ?, scan_current = 0, scan_total = 0, scan_current_prs = NULL, collected_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
   ).run(statusMessage, repository.id);
   return NextResponse.json({ ok: true });
 }

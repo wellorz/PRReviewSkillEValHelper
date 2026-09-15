@@ -93,6 +93,26 @@ export function parsePathFilters(value: string | null | undefined) {
     .filter(Boolean);
 }
 
+export function prNumberMatchesRange(
+  number: number,
+  greaterThan: number | null | undefined,
+  lessThan: number | null | undefined,
+) {
+  return (
+    (greaterThan == null || number > greaterThan) &&
+    (lessThan == null || number < lessThan)
+  );
+}
+
+export function prCreatedOnOrBefore(
+  createdAt: string | null | undefined,
+  inclusiveDate: string | null | undefined,
+) {
+  if (!inclusiveDate) return true;
+  if (!createdAt) return false;
+  return createdAt.slice(0, 10) <= inclusiveDate;
+}
+
 export function pathMatchesFilters(
   filePath: string,
   filters: string[],

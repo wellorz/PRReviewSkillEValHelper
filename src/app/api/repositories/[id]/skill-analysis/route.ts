@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getDb } from "@/lib/db";
-import { hasCurrentWorkflowWorkerVersion } from "@/lib/workflow-version";
 import type { RepositoryRecord } from "@/lib/types";
+import { workerAvailableForRepository } from "@/lib/worker-availability";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -34,18 +34,27 @@ export async function POST(
       { status: 400 },
     );
   }
-  if (!hasCurrentWorkflowWorkerVersion()) {
-    return NextResponse.json(
-      { error: "Restart the worker before starting skill analysis." },
-      { status: 409 },
-    );
-  }
   const db = getDb();
   const repository = db
     .prepare("SELECT * FROM repositories WHERE id = ?")
     .get(id) as RepositoryRecord | undefined;
   if (!repository) {
     return NextResponse.json({ error: "Repository not found" }, { status: 404 });
+  }
+  if (repository.build_knowledge_graph && !repository.local_repo_path?.trim()) {
+    return NextResponse.json(
+      {
+        error:
+          "Set a verified Local repository path before building a knowledge graph.",
+      },
+      { status: 409 },
+    );
+  }
+  if (!workerAvailableForRepository(repository)) {
+    return NextResponse.json(
+      { error: "Restart the worker before starting skill analysis." },
+      { status: 409 },
+    );
   }
   const skill = db
     .prepare(`

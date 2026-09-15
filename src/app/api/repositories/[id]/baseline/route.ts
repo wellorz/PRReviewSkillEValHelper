@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getDb } from "@/lib/db";
 import { filterPullRequestsByChangedPath } from "@/lib/pr-path-filter";
-import { hasCurrentWorkflowWorkerVersion } from "@/lib/workflow-version";
 import { queueBaselineProfileResults } from "@/lib/workflow-result-queue";
+import { workerAvailableForRepository } from "@/lib/worker-availability";
 
 const schema = z.object({
   pullRequestIds: z.array(z.number().int().positive()).min(1),
@@ -25,13 +25,15 @@ export async function POST(
   const db = getDb();
   const repository = db
     .prepare(
-      "SELECT baseline_concurrency, local_repo_path, local_repo_branch FROM repositories WHERE id = ?",
+      "SELECT baseline_concurrency, local_repo_path, local_repo_branch, status, updated_at FROM repositories WHERE id = ?",
     )
     .get(id) as
     | {
         baseline_concurrency: number;
         local_repo_path: string | null;
         local_repo_branch: string | null;
+        status: string;
+        updated_at: string;
       }
     | undefined;
   if (!repository) {
@@ -85,7 +87,7 @@ export async function POST(
     ? [...new Set(parsed.data.profileIds)]
     : null;
   if (profileIds) {
-    if (!hasCurrentWorkflowWorkerVersion()) {
+    if (!workerAvailableForRepository(repository)) {
       return NextResponse.json(
         {
           error:
@@ -113,7 +115,7 @@ export async function POST(
   const enqueue = db.transaction(() => {
     const result = db
       .prepare(
-        "INSERT INTO workflow_tasks (repository_id, kind, pr_ids_json, payload_json, total_items) VALUES (?, 'baseline', ?, ?, ?)",
+        "INSERT INTO workflow_tasks (repository_id, kind, pr_ids_json, payload_json, total_items, status_message) VALUES (?, 'baseline', ?, ?, ?, ?)",
       )
       .run(
         id,
@@ -130,6 +132,7 @@ export async function POST(
             : {}),
         }),
         totalItems,
+        "Waiting for worker",
       );
     if (profileIds) {
       queueBaselineProfileResults(db, { profileIds, pullRequestIds });

@@ -151,6 +151,112 @@ test("creates and safely removes a detached historical worktree", async () => {
   }
 });
 
+test("recreates a registered worktree whose git marker is missing", async () => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const source = path.join(process.cwd(), "runtime", `stale-source-${suffix}`);
+  const dataset = path.join(process.cwd(), "runtime", `stale-data-${suffix}`);
+  const worktreeRoot = path.join(
+    DATA_DIR,
+    "workflow",
+    `stale-test-${suffix}`,
+  );
+  const worktree = path.join(worktreeRoot, "repository");
+  try {
+    await fs.mkdir(source, { recursive: true });
+    assert.equal(
+      (await runCommand("git", ["init", "--quiet", source])).exitCode,
+      0,
+    );
+    await fs.writeFile(path.join(source, "tracked.txt"), "historical");
+    assert.equal(
+      (
+        await runCommand("git", [
+          "-C",
+          source,
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.com",
+          "add",
+          "tracked.txt",
+        ])
+      ).exitCode,
+      0,
+    );
+    assert.equal(
+      (
+        await runCommand("git", [
+          "-C",
+          source,
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.com",
+          "commit",
+          "--quiet",
+          "-m",
+          "fixture",
+        ])
+      ).exitCode,
+      0,
+    );
+    const sha = (
+      await runCommand("git", ["-C", source, "rev-parse", "HEAD"])
+    ).stdout.trim();
+    await fs.mkdir(dataset, { recursive: true });
+    await fs.writeFile(
+      path.join(dataset, "pr.json"),
+      JSON.stringify({ head: { sha } }),
+    );
+    assert.equal(
+      (
+        await runCommand("git", [
+          "-C",
+          source,
+          "worktree",
+          "add",
+          "--detach",
+          worktree,
+          sha,
+        ])
+      ).exitCode,
+      0,
+    );
+    await fs.rm(path.join(worktree, ".git"));
+    const repository = {
+      provider: "github",
+      slug: "owner/repo",
+      repository_name: "repo",
+      project_name: null,
+      local_repo_path: source,
+    } as RepositoryRecord;
+    await runCommand("git", [
+      "-C",
+      source,
+      "remote",
+      "add",
+      "origin",
+      "https://github.com/owner/repo.git",
+    ]);
+
+    const context = await createHistoricalRepositoryContext({
+      repository,
+      datasetPath: dataset,
+      worktreePath: worktree,
+    });
+    assert.equal(context.commit, sha);
+    assert.equal(
+      await fs.readFile(path.join(worktree, "tracked.txt"), "utf8"),
+      "historical",
+    );
+    await context.cleanup();
+  } finally {
+    await fs.rm(source, { recursive: true, force: true });
+    await fs.rm(dataset, { recursive: true, force: true });
+    await fs.rm(worktreeRoot, { recursive: true, force: true });
+  }
+});
+
 test("uses a verified Azure squash commit from the selected branch", async () => {
   const suffix = `${process.pid}-${Date.now()}`;
   const source = path.join(process.cwd(), "runtime", `squash-source-${suffix}`);

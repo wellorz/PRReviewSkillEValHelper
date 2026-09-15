@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { createAsyncGate, type AsyncGate } from "@/lib/async-gate";
 import {
   parseReviewOutput,
   prepareSkillRoot,
@@ -9,13 +10,22 @@ import {
   runQuickOrchestration,
 } from "@/lib/copilot";
 import { getDb } from "@/lib/db";
-import { collectPullRequestSnapshot } from "@/lib/github";
+import { runNativeDevLoopReview } from "@/lib/devloop-review";
+import {
+  collectPullRequestBenchmarkSnapshot,
+  collectPullRequestSnapshot,
+} from "@/lib/github";
 import {
   loadGroundTruth,
   loadReviewSnapshots,
   type ReviewSnapshot,
 } from "@/lib/ground-truth";
 import { DATA_DIR } from "@/lib/paths";
+import { personalSkillTriggerInstruction } from "@/lib/personal-skill-trigger";
+import {
+  isDevLoopLocalExecution,
+  personalSkillResultConfiguration,
+} from "@/lib/personal-skill-execution";
 import { createHistoricalRepositoryContext } from "@/lib/repository-context";
 import { jaccard, scoreReview, scoreReviewPair } from "@/lib/scoring";
 import type {
@@ -31,8 +41,9 @@ import {
   throwIfWorkflowCancelled,
   WorkflowCancellationError,
 } from "@/lib/workflow-cancellation";
+import { reservedSkillReviewSlots } from "@/lib/workflow-task-concurrency";
 
-type WorkflowTask = {
+export type WorkflowTask = {
   id: number;
   repository_id: number;
   kind: "manual_pr" | "baseline" | "skill_eval";
@@ -90,9 +101,7 @@ function resetCancelledTaskResults(task: WorkflowTask) {
   if (
     task.kind === "skill_eval" &&
     payload.skillIds?.length &&
-    payload.model &&
-    payload.modelSecondary &&
-    payload.contextTier
+    payload.model
   ) {
     const skillIds = [...new Set(payload.skillIds)];
     const skillPlaceholders = skillIds.map(() => "?").join(",");
@@ -101,15 +110,8 @@ function resetCancelledTaskResults(task: WorkflowTask) {
       SET status = 'pending', error = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE pull_request_id IN (${prPlaceholders})
         AND skill_id IN (${skillPlaceholders})
-        AND model = ? AND model_secondary = ? AND context_tier = ?
         AND status = 'running'
-    `).run(
-      ...pullRequestIds,
-      ...skillIds,
-      payload.model,
-      payload.modelSecondary,
-      payload.contextTier,
-    );
+    `).run(...pullRequestIds, ...skillIds);
     return;
   }
   if (task.kind === "baseline") {
@@ -127,34 +129,64 @@ function resetCancelledTaskResults(task: WorkflowTask) {
   }
 }
 
-async function waitForPersonalSkillPriority(
+const activeBaselineReviewSlots = new Map<number, number>();
+
+async function acquireBaselineReviewSlot(
   taskId: number,
   repositoryId: number,
+  concurrency: number,
 ) {
   const db = getDb();
-  let paused = false;
-  while (
-    db
+  let waiting = false;
+  while (true) {
+    throwIfWorkflowCancelled();
+    const skillTasks = db
       .prepare(`
-        SELECT 1
+        SELECT current_item, total_items, payload_json
         FROM workflow_tasks
         WHERE repository_id = ?
           AND kind = 'skill_eval'
           AND status IN ('queued', 'running')
-        LIMIT 1
       `)
-      .get(repositoryId)
-  ) {
-    throwIfWorkflowCancelled();
-    if (!paused) {
+      .all(repositoryId) as Array<{
+      current_item: number;
+      total_items: number;
+      payload_json: string | null;
+    }>;
+    const reservedForSkills = reservedSkillReviewSlots(
+      skillTasks.map((task) => ({
+        currentItem: task.current_item,
+        totalItems: task.total_items,
+        payloadJson: task.payload_json,
+      })),
+      concurrency,
+    );
+    const activeBaseline = activeBaselineReviewSlots.get(repositoryId) ?? 0;
+    if (activeBaseline + reservedForSkills < concurrency) {
+      activeBaselineReviewSlots.set(repositoryId, activeBaseline + 1);
       db.prepare(`
         UPDATE workflow_tasks
-        SET status_message = 'Paused while personal skill reviews have priority'
+        SET status_message = 'Running baseline reviews with shared review capacity'
         WHERE id = ? AND status = 'running'
       `).run(taskId);
-      paused = true;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const current = activeBaselineReviewSlots.get(repositoryId) ?? 1;
+        if (current <= 1) activeBaselineReviewSlots.delete(repositoryId);
+        else activeBaselineReviewSlots.set(repositoryId, current - 1);
+      };
     }
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    if (!waiting) {
+      db.prepare(`
+        UPDATE workflow_tasks
+        SET status_message = 'Waiting for available shared review capacity'
+        WHERE id = ? AND status = 'running'
+      `).run(taskId);
+      waiting = true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }
 
@@ -417,7 +449,10 @@ async function runSnapshotReviews(options: {
   contextTier: string;
   skillRoot?: string;
   skillName?: string;
+  triggerInstruction?: string | null;
+  executionMode?: string;
   repositoryContextMode?: "local_repo" | "diff";
+  reviewGate?: AsyncGate;
 }) {
   const snapshots = await loadReviewSnapshots(options.pr);
   if (snapshots.length === 0) {
@@ -427,18 +462,48 @@ async function runSnapshotReviews(options: {
     options.skillRoot,
     options.skillName,
   );
-  const executions: SnapshotReviewExecution[] = [];
-  for (const snapshot of snapshots) {
-    const snapshotRoot = path.join(
-      options.root,
-      `${options.workspacePrefix}-${snapshot.key}`,
-    );
-    const execution = await withHistoricalRepositoryContext({
+  const executions = await Promise.all(snapshots.map(async (snapshot) => {
+    const runSnapshot = async () => {
+      const snapshotRoot = path.join(
+        options.root,
+        `${options.workspacePrefix}-${snapshot.key}`,
+      );
+      return withHistoricalRepositoryContext({
       repository: options.repository,
       datasetPath: snapshot.datasetPath,
       worktreePath: path.join(snapshotRoot, "repository"),
       forceDiffOnly: options.repositoryContextMode === "diff",
       action: async (repositoryContext) => {
+        if (isDevLoopLocalExecution(options.executionMode)) {
+          if (!repositoryContext || !snapshot.targetCommit) {
+            throw new Error(
+              `DevLoop local review requires an exact detached repository for ${snapshot.key}`,
+            );
+          }
+          const devLoopWorkspace = path.join(snapshotRoot, "devloop");
+          await copySnapshot(
+            snapshot.datasetPath,
+            devLoopWorkspace,
+            repositoryContext,
+          );
+          const native = await runNativeDevLoopReview({
+            workspace: devLoopWorkspace,
+            skillRoot: options.skillRoot!,
+            expectedPrId: options.pr.number,
+            expectedSourceCommit: snapshot.sourceCommit,
+            expectedTargetCommit: snapshot.targetCommit,
+            expectedIterationId: snapshot.iterationId ?? 1,
+          });
+          return {
+            snapshot,
+            review: tagSnapshotReview(native.output, snapshot),
+            durationMs: native.durationMs,
+            usage: { devLoop: native.usage },
+            rawOutput: { devLoop: native.rawOutput },
+            repositoryContextMode: "local_repo",
+            repositoryCommit: repositoryContext.commit,
+          } satisfies SnapshotReviewExecution;
+        }
         if (options.skillName?.toLowerCase() === "wz-review") {
           if (repositoryContext && !snapshot.targetCommit) {
             throw new Error(
@@ -461,6 +526,7 @@ async function runSnapshotReviews(options: {
             model: options.model,
             contextTier: options.contextTier,
             skillRoot: options.skillRoot!,
+            triggerInstruction: options.triggerInstruction,
             usagePath: path.join(snapshotRoot, "wz-review-usage.json"),
           });
           const nativeReview = addExecutionProvenance(
@@ -494,6 +560,7 @@ async function runSnapshotReviews(options: {
           contextTier: options.contextTier,
           skillRoot: options.skillRoot,
           skillName: options.skillName,
+          triggerInstruction: options.triggerInstruction,
           repositoryRoot: repositoryContext?.path,
           usagePath: path.join(snapshotRoot, "model1-usage.json"),
         });
@@ -513,6 +580,7 @@ async function runSnapshotReviews(options: {
                   contextTier: options.contextTier,
                   skillRoot: options.skillRoot,
                   skillName: options.skillName,
+                  triggerInstruction: options.triggerInstruction,
                   repositoryRoot: repositoryContext?.path,
                   usagePath: path.join(snapshotRoot, "model2-usage.json"),
                 });
@@ -594,9 +662,12 @@ async function runSnapshotReviews(options: {
           repositoryCommit: repositoryContext?.commit ?? null,
         } satisfies SnapshotReviewExecution;
       },
-    });
-    executions.push(execution);
-  }
+      });
+    };
+    return options.reviewGate
+      ? options.reviewGate.run(runSnapshot)
+      : runSnapshot();
+  }));
   return {
     executions,
     review: combineSnapshotReviews(executions),
@@ -622,6 +693,7 @@ async function runSnapshotReviews(options: {
         ...executionEvidence,
         nativeWorkflow:
           options.skillName?.toLowerCase() === "wz-review",
+        executionMode: options.executionMode ?? "copilot-skill",
         model: options.model,
         modelSecondary: options.modelSecondary,
         contextTier: options.contextTier,
@@ -654,18 +726,17 @@ function highestReviewSeverity(review: ReviewOutput) {
   ).toUpperCase();
 }
 
-async function processManualPr(
-  task: WorkflowTask,
+async function processManualPrItem(
   repository: RepositoryRecord,
+  prNumber: number,
+  requireValuedComments: boolean,
 ) {
   const db = getDb();
-  const payload = JSON.parse(task.payload_json ?? "{}") as { prNumber?: number };
-  if (!payload.prNumber) throw new Error("Manual PR task is missing a PR number");
   const existing = db
     .prepare(
       "SELECT dataset_path FROM pull_requests WHERE repository_id = ? AND number = ?",
     )
-    .get(repository.id, payload.prNumber) as
+    .get(repository.id, prNumber) as
     | { dataset_path: string }
     | undefined;
   const destination =
@@ -674,22 +745,35 @@ async function processManualPr(
       DATA_DIR,
       "datasets",
       repository.slug.replaceAll("/", "__"),
-      `pr-${payload.prNumber}`,
+      `pr-${prNumber}`,
     );
-  db.prepare(
-    "UPDATE workflow_tasks SET status_message = 'Downloading PR metadata and filtered diff', total_items = 1 WHERE id = ?",
-  ).run(task.id);
-  const metadata = await collectPullRequestSnapshot(
-    repository,
-    payload.prNumber,
-    destination,
-  );
+  const benchmarkSnapshot = requireValuedComments
+    ? await collectPullRequestBenchmarkSnapshot(
+        repository,
+        prNumber,
+        destination,
+      )
+    : null;
+  if (requireValuedComments && !benchmarkSnapshot) {
+    return { outcome: "skipped" as const, findingCount: 0 };
+  }
+  const metadata =
+    benchmarkSnapshot?.metadata ??
+    (await collectPullRequestSnapshot(
+      repository,
+      prNumber,
+      destination,
+    ));
+  const findingCount =
+    benchmarkSnapshot?.findings.filter(
+      (finding) => (finding.scorePoint ?? 1) === 1,
+    ).length ?? 0;
   db.prepare(`
     INSERT INTO pull_requests (
       repository_id, number, title, url, author, base_ref, head_ref,
       merged_at, updated_at, additions, deletions, changed_files,
       valued_comment_count, dataset_path, raw_json, active, selected, manual
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1, 1, 1)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?)
     ON CONFLICT(repository_id, number) DO UPDATE SET
       title = excluded.title,
       url = excluded.url,
@@ -703,7 +787,8 @@ async function processManualPr(
       raw_json = excluded.raw_json,
       active = 1,
       selected = 1,
-      manual = 1,
+      valued_comment_count = excluded.valued_comment_count,
+      manual = excluded.manual,
       excluded_by_user = 0
   `).run(
     repository.id,
@@ -718,12 +803,117 @@ async function processManualPr(
     metadata.additions,
     metadata.deletions,
     metadata.changedFiles,
+    findingCount,
     destination,
     JSON.stringify(metadata),
+    requireValuedComments ? 0 : 1,
+  );
+  return { outcome: "eligible" as const, findingCount };
+}
+
+async function processManualPr(
+  task: WorkflowTask,
+  repository: RepositoryRecord,
+) {
+  const db = getDb();
+  const payload = JSON.parse(task.payload_json ?? "{}") as {
+    prNumber?: number;
+    prNumbers?: number[];
+    requireValuedComments?: boolean;
+    concurrency?: number;
+  };
+  const prNumbers = [
+    ...new Set(
+      payload.prNumbers ??
+        (payload.prNumber ? [payload.prNumber] : []),
+    ),
+  ];
+  if (prNumbers.length === 0) {
+    throw new Error("Manual PR task is missing PR numbers");
+  }
+  const concurrency = Math.max(
+    1,
+    Math.min(20, payload.concurrency ?? (prNumbers.length > 1 ? 5 : 1)),
+  );
+  let nextIndex = 0;
+  let completed = 0;
+  let eligible = 0;
+  let skipped = 0;
+  const errors: string[] = [];
+  db.prepare(
+    "UPDATE workflow_tasks SET status_message = ?, total_items = ? WHERE id = ?",
+  ).run(
+    `Checking ${prNumbers.length} PR candidates with ${concurrency} parallel workers`,
+    prNumbers.length,
+    task.id,
+  );
+
+  async function checkNext() {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= prNumbers.length) return;
+      const prNumber = prNumbers[index];
+      try {
+        throwIfWorkflowCancelled();
+        const result = await processManualPrItem(
+          repository,
+          prNumber,
+          payload.requireValuedComments ?? false,
+        );
+        if (result.outcome === "eligible") eligible += 1;
+        else skipped += 1;
+      } catch (error) {
+        throwIfWorkflowCancelled(error);
+        errors.push(
+          `PR #${prNumber}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      } finally {
+        completed += 1;
+        db.prepare(
+          "UPDATE workflow_tasks SET current_item = ?, status_message = ? WHERE id = ? AND status = 'running'",
+        ).run(
+          completed,
+          `Checking ${prNumbers.length} PR candidates with ${concurrency} parallel workers · ${completed}/${prNumbers.length} complete`,
+          task.id,
+        );
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, prNumbers.length) },
+      () => checkNext(),
+    ),
+  );
+  if (errors.length > 0) {
+    throw new Error(
+      `${errors.length} of ${prNumbers.length} PR candidate checks failed:\n${errors.join("\n")}`,
+    );
+  }
+  const activePrCount = (
+    db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM pull_requests WHERE repository_id = ? AND active = 1",
+      )
+      .get(repository.id) as { count: number }
+  ).count;
+  db.prepare(
+    "UPDATE repositories SET collected_count = ?, status_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+  ).run(
+    activePrCount,
+    `PR set contains ${activePrCount} eligible PRs; latest candidate batch added ${eligible} and skipped ${skipped}`,
+    repository.id,
   );
   db.prepare(
-    "UPDATE workflow_tasks SET current_item = 1, status_message = 'PR added to workspace' WHERE id = ?",
-  ).run(task.id);
+    "UPDATE workflow_tasks SET status_message = ? WHERE id = ?",
+  ).run(
+    `Complete: ${eligible} eligible, ${skipped} skipped · concurrency ${concurrency}`,
+    task.id,
+  );
 }
 
 async function processLegacyBaseline(
@@ -1339,7 +1529,7 @@ export async function rescoreCompletedResults(repositoryId?: number) {
         SELECT id, number, title, url, dataset_path, defect_description,
           baseline_status, baseline_duration_ms, baseline_findings_json
         FROM pull_requests
-        WHERE repository_id = ? AND active = 1
+        WHERE repository_id = ?
       `)
       .all(repository.id) as WorkflowPr[];
     const profiles = db
@@ -1348,6 +1538,40 @@ export async function rescoreCompletedResults(repositoryId?: number) {
 
     for (const pr of pullRequests) {
       const truth = await loadGroundTruth(pr);
+      const completedSkillResults = db
+        .prepare(`
+          SELECT skill_id, model, model_secondary, context_tier, findings_json
+          FROM personal_skill_results
+          WHERE pull_request_id = ? AND status = 'completed'
+        `)
+        .all(pr.id) as Array<{
+        skill_id: number;
+        model: string;
+        model_secondary: string;
+        context_tier: string;
+        findings_json: string | null;
+      }>;
+      for (const skillResult of completedSkillResults) {
+        const metrics = scoreReview(
+          truth,
+          parseFindings(skillResult.findings_json),
+        );
+        db.prepare(`
+          UPDATE personal_skill_results SET
+            metrics_json = ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE skill_id = ? AND pull_request_id = ?
+            AND model = ? AND model_secondary = ? AND context_tier = ?
+        `).run(
+          JSON.stringify(metrics),
+          skillResult.skill_id,
+          pr.id,
+          skillResult.model,
+          skillResult.model_secondary,
+          skillResult.context_tier,
+        );
+        skillResults += 1;
+      }
       for (const profile of profiles) {
         const baselineResult = db
           .prepare(`
@@ -1378,23 +1602,7 @@ export async function rescoreCompletedResults(repositoryId?: number) {
         `).run(JSON.stringify(metrics), profile.id, pr.id);
         baselineResults += 1;
 
-        const before = db
-          .prepare(`
-            SELECT COUNT(*) count
-            FROM personal_skill_results
-            WHERE baseline_profile_id = ? AND pull_request_id = ?
-              AND status = 'completed'
-              AND model = ? AND model_secondary = ? AND context_tier = ?
-          `)
-          .get(
-            profile.id,
-            pr.id,
-            profile.model,
-            profile.model_secondary,
-            profile.context_tier,
-          ) as { count: number };
         await reconcileSkillComparisons(repository, pr, profile);
-        skillResults += before.count;
       }
     }
   }
@@ -1440,10 +1648,17 @@ async function processBaselineProfiles(
 
   async function reviewNextUnit() {
     while (true) {
-      await waitForPersonalSkillPriority(task.id, repository.id);
+      const releaseSlot = await acquireBaselineReviewSlot(
+        task.id,
+        repository.id,
+        concurrency,
+      );
       const index = nextIndex;
       nextIndex += 1;
-      if (index >= units.length) return;
+      if (index >= units.length) {
+        releaseSlot();
+        return;
+      }
       const { profile, pullRequestId } = units[index];
       const pr = db
         .prepare(`
@@ -1553,6 +1768,7 @@ async function processBaselineProfiles(
         }
         errors.push(`${profileLabel(profile)} / PR ${pr ? `#${pr.number}` : pullRequestId}: ${message}`);
       } finally {
+        releaseSlot();
         completed += 1;
         db.prepare(
           "UPDATE workflow_tasks SET current_item = ?, status_message = ? WHERE id = ?",
@@ -1657,10 +1873,27 @@ async function processNamedSkillEval(
   );
   const skillsById = new Map(skills.map((skill) => [skill.id, skill]));
   const orderedSkills = skillIds.map((skillId) => skillsById.get(skillId)!);
-  const units = requestedPrIds.flatMap((pullRequestId) =>
-    orderedSkills.map((skill) => ({ skill, pullRequestId })),
-  );
+  const units = requestedPrIds
+    .flatMap((pullRequestId) =>
+      orderedSkills.map((skill) => ({ skill, pullRequestId })),
+    )
+    .sort(
+      (left, right) =>
+        Number(isDevLoopLocalExecution(left.skill.execution_mode)) -
+        Number(isDevLoopLocalExecution(right.skill.execution_mode)),
+    );
   const parallelism = Math.min(concurrency, units.length);
+  const reviewGate = createAsyncGate(concurrency);
+  const taskPayload = JSON.parse(task.payload_json ?? "{}") as Record<
+    string,
+    unknown
+  >;
+  db.prepare(
+    "UPDATE workflow_tasks SET payload_json = ? WHERE id = ?",
+  ).run(
+    JSON.stringify({ ...taskPayload, snapshotParallelism: true }),
+    task.id,
+  );
   db.prepare(
     "UPDATE workflow_tasks SET total_items = ?, status_message = ? WHERE id = ?",
   ).run(
@@ -1702,6 +1935,10 @@ async function processNamedSkillEval(
       nextIndex += 1;
       if (index >= units.length) return;
       const { skill, pullRequestId } = units[index];
+      const resultConfiguration = personalSkillResultConfiguration(
+        skill.execution_mode,
+        payload,
+      );
       const pr = db
         .prepare(`
           SELECT id, number, title, url, dataset_path, defect_description,
@@ -1722,9 +1959,9 @@ async function processNamedSkillEval(
           .get(
             skill.id,
             pr.id,
-            payload.model,
-            payload.modelSecondary,
-            payload.contextTier,
+            resultConfiguration.model,
+            resultConfiguration.modelSecondary,
+            resultConfiguration.contextTier,
           ) as { status: string; error: string | null } | undefined;
         if (previous?.status === "completed") continue;
         if (previous?.status === "failed") {
@@ -1748,6 +1985,7 @@ async function processNamedSkillEval(
             usage_json = NULL,
             metrics_json = NULL,
             raw_output_json = NULL,
+            skill_snapshot_path = NULL,
             repository_context_mode = excluded.repository_context_mode,
             repository_commit = NULL,
             error = NULL,
@@ -1757,9 +1995,9 @@ async function processNamedSkillEval(
         `).run(
           skill.id,
           pr.id,
-          payload.model,
-          payload.modelSecondary,
-          payload.contextTier,
+          resultConfiguration.model,
+          resultConfiguration.modelSecondary,
+          resultConfiguration.contextTier,
           reviewRepository.local_repo_path ? "local_repo" : "diff",
         );
         const prepared = preparedSkills.get(skill.id);
@@ -1768,17 +2006,24 @@ async function processNamedSkillEval(
         }
         const preparedSkillRoot = prepared.root;
         const skillDirectory = path.join(root, `skill-${skill.id}`);
-        const result = await runSnapshotReviews({
-          repository: reviewRepository,
-          pr,
-          root: skillDirectory,
-          workspacePrefix: `pr-${pr.number}-skill`,
-          model: payload.model,
-          modelSecondary: payload.modelSecondary,
-          contextTier: payload.contextTier,
-          skillRoot: preparedSkillRoot,
-          skillName: path.basename(skill.path),
-        });
+        const runReview = () =>
+          runSnapshotReviews({
+            repository: reviewRepository,
+            pr,
+            root: skillDirectory,
+            workspacePrefix: `pr-${pr.number}-skill`,
+            model: resultConfiguration.model,
+            modelSecondary: resultConfiguration.modelSecondary,
+            contextTier: resultConfiguration.contextTier,
+            skillRoot: preparedSkillRoot,
+            skillName: path.basename(skill.path),
+            triggerInstruction: personalSkillTriggerInstruction(
+              skill.trigger_instruction,
+            ),
+            executionMode: skill.execution_mode,
+            reviewGate,
+          });
+        const result = await runReview();
         const truth = await loadGroundTruth(pr);
         const metrics = scoreReview(truth, result.review.findings);
         const reportPath = path.join(
@@ -1804,6 +2049,7 @@ async function processNamedSkillEval(
                 usage_json = ?,
                 metrics_json = ?,
                 raw_output_json = ?,
+                skill_snapshot_path = ?,
                 repository_context_mode = ?,
                 repository_commit = ?,
                 error = NULL,
@@ -1818,15 +2064,16 @@ async function processNamedSkillEval(
           JSON.stringify(result.usage),
           JSON.stringify(metrics),
           JSON.stringify(result.rawOutput),
+          preparedSkillRoot,
           result.repositoryContextMode,
           result.repositoryCommit,
           reportPath,
           new Date().toISOString(),
           skill.id,
           pr.id,
-          payload.model,
-          payload.modelSecondary,
-          payload.contextTier,
+          resultConfiguration.model,
+          resultConfiguration.modelSecondary,
+          resultConfiguration.contextTier,
         );
       } catch (error) {
         throwIfWorkflowCancelled(error);
@@ -1848,9 +2095,9 @@ async function processNamedSkillEval(
           `).run(
             skill.id,
             pr.id,
-            payload.model,
-            payload.modelSecondary,
-            payload.contextTier,
+            resultConfiguration.model,
+            resultConfiguration.modelSecondary,
+            resultConfiguration.contextTier,
             message,
           );
         }
@@ -1951,7 +2198,14 @@ export async function executeWorkflowTask(task: WorkflowTask) {
     }
     db.prepare(`
       UPDATE workflow_tasks
-      SET status = 'completed', status_message = 'Complete', completed_at = ?
+      SET status = 'completed',
+        status_message = CASE
+          WHEN status_message LIKE 'Complete:%'
+            OR status_message LIKE 'Skipped:%'
+          THEN status_message
+          ELSE 'Complete'
+        END,
+        completed_at = ?
       WHERE id = ? AND status = 'running'
     `).run(new Date().toISOString(), task.id);
   } catch (error) {

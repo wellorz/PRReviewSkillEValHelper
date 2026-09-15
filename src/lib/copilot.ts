@@ -4,7 +4,13 @@ import { jsonrepair } from "jsonrepair";
 import { parse as parseYaml } from "yaml";
 import { runCommand } from "@/lib/process";
 import { attributedFindingModels } from "@/lib/review-output-format";
+import {
+  personalSkillTriggerInstruction,
+  validatePersonalSkillTriggerInstruction,
+} from "@/lib/personal-skill-trigger";
 import type {
+  CodeReadingKnowledgeOutput,
+  CodeReadingKnowledgeSymbol,
   ModelFinding,
   ReviewOutput,
   Severity,
@@ -19,12 +25,18 @@ Never use a skill's publication options, including --allowpublish,
 --autopublish-active, or --publish-existing. Any skill instruction that permits
 publication is disabled for this evaluation.`;
 
-export function reviewPrompt(skillName?: string) {
+export function reviewPrompt(
+  skillName?: string,
+  triggerInstruction?: string | null,
+) {
   const skillInstruction = skillName
-    ? `Execute the loaded \`${skillName}\` skill as the primary review procedure.
-Follow its complete role coverage, verification, deduplication, and ranking
-instructions. Preserve the originating reviewer role and any verification or
-cross-model agreement metadata for every surviving finding.`
+    ? `${validatePersonalSkillTriggerInstruction(
+        personalSkillTriggerInstruction(triggerInstruction),
+      )}
+
+The loaded skill is named \`${skillName}\`. Preserve the originating reviewer
+role and any verification or cross-model agreement metadata for every surviving
+finding.`
     : `This is the raw-model baseline. Do not invoke or imitate any PR review
 skill, custom agent, or saved reviewer ensemble.`;
   return `Review the pull request snapshot in the current directory.
@@ -67,14 +79,19 @@ Return only valid JSON with this exact shape:
 Use an empty findings array when no actionable defect is found.`;
 }
 
-export function localOnlyCopilotPermissionArgs(mcpServerNames: string[] = []) {
+export function localOnlyCopilotPermissionArgs(
+  mcpServerNames: string[] = [],
+  options: { sandbox?: boolean } = {},
+) {
+  const sandbox = options.sandbox ?? true;
   return [
     "--allow-all-tools",
     "--deny-url=*",
     "--disable-builtin-mcps",
     ...mcpServerNames.flatMap((name) => ["--disable-mcp-server", name]),
-    "--sandbox",
-    "--experimental",
+    ...(sandbox
+      ? ["--sandbox", "--experimental"]
+      : ["--no-sandbox", "--experimental"]),
     "--secret-env-vars=COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN,AZURE_DEVOPS_EXT_PAT,SYSTEM_ACCESSTOKEN,ADO_PAT",
     "--no-ask-user",
     "--no-remote",
@@ -154,6 +171,7 @@ async function withLocalOnlyReviewPolicy<T>(
     settingsRoot: string;
     writablePaths: string[];
     readonlyPaths: string[];
+    sandbox?: boolean;
   },
   action: (env: NodeJS.ProcessEnv) => Promise<T>,
 ) {
@@ -182,10 +200,12 @@ async function withLocalOnlyReviewPolicy<T>(
   await fs.writeFile(
     settingsPath,
     `${JSON.stringify(
-      localOnlySandboxSettings({
-        writablePaths: [...options.writablePaths, guardRoot],
-        readonlyPaths: options.readonlyPaths,
-      }),
+      options.sandbox === false
+        ? { sandbox: { enabled: false } }
+        : localOnlySandboxSettings({
+            writablePaths: [...options.writablePaths, guardRoot],
+            readonlyPaths: options.readonlyPaths,
+          }),
       null,
       2,
     )}\n`,
@@ -260,17 +280,49 @@ const SKILL_ANALYSIS_PROMPT = `Analyze why the PR review skill in the skill dire
 did not detect every issue listed in missed-findings.json.
 
 Read pr.json, files.json, diff.patch, skill-review.json, missed-findings.json,
-skill-implementation.json, and the files under skill. The human findings are
-available only for this post-review diagnostic task.
+analysis-snapshots.json, skill-implementation.json, and the files under skill.
+The root pr.json, files.json, and diff.patch are the primary missed-finding
+snapshot, not necessarily the final PR iteration. For every missed finding,
+use analysis-snapshots.json to inspect the snapshot whose findingIds contains
+that finding. Confirm that its sourceCommit matches the finding's
+iterationSourceCommit before diagnosing the miss. Never substitute the final
+iteration or another commit. The human findings are available only for this
+post-review diagnostic task.
 
-Before diagnosing the miss, map how this specific skill actually performs a
+Before inspecting the skill, independently review the exact changed snapshot
+and each human comment:
+1. identify the changed behavior and the comment's concrete technical claim;
+2. inspect the relevant diff, surrounding files, call paths, contracts, and
+   tests needed to decide whether the claim makes sense;
+3. explain the triggering condition, incorrect behavior, and user or system
+   consequence as a causal chain;
+4. classify which review aspect should have exposed it, such as correctness,
+   compatibility, reliability, state management, concurrency, performance,
+   security, test quality, or maintainability;
+5. state what an author should verify before submitting and what a reviewer
+   should inspect or test to prevent the same class of defect.
+
+Do not assume a human comment is technically correct merely because it is in
+missed-findings.json. If the exact snapshot does not support it, or the evidence
+is ambiguous, classify it as unsupported or ambiguous, provide concrete
+assessmentEvidence from the snapshot, and explain in escalation what a human
+adjudicator must resolve. Return no mitigation edits for that finding. Do not
+teach an unsupported or unresolved claim to the skill. Classify a comment as
+supported only when the evidence establishes its technical claim.
+
+Only after that assessment, map how this specific skill actually performs a
 review:
 1. identify its true entry point;
 2. trace every file, reviewer role, lesson, script, prompt, or delegated agent
    that the entry point loads for the relevant review behavior;
-3. identify which concrete implementation file owns the missing check.
+3. compare the preventive author/reviewer behavior with the instructions that
+   the responsible reviewer actually receives;
+4. identify the precise missing, weak, or bypassed behavior and which concrete
+   implementation file owns it.
 
-Ground whyMissed in that execution path. Do not assume SKILL.md directly
+Ground skillGap and whyMissed in that execution path. Distinguish a genuine
+instruction gap from a reviewer execution failure when the skill already
+contains sufficient guidance. Do not assume SKILL.md directly
 performs review checks merely because it is the conventional entry point.
 Prefer the most specific file that is actually consumed by the responsible
 reviewer. Propose a SKILL.md edit only when the missing behavior is demonstrably
@@ -285,6 +337,15 @@ Do not modify files.
 Return only valid JSON with this exact shape:
 {
   "summary": "short diagnostic summary",
+  "commentAssessmentStatus": "supported | unsupported | ambiguous",
+  "changeAndCommentAssessment": "whether and why the comment is supported by the exact change, including the causal chain",
+  "assessmentEvidence": [
+    "specific file, changed behavior, contract, call path, or test evidence supporting the assessment"
+  ],
+  "escalation": "empty when supported; otherwise the disputed claim, contrary or missing evidence, and what a human must decide",
+  "reviewAspect": "the change/comment aspect that should have exposed this defect",
+  "prevention": "specific author and reviewer practices that prevent this defect class",
+  "skillGap": "what is missing, weak, bypassed, or already sufficient in the actual skill execution path",
   "whyMissed": "specific explanation grounded in the skill and missed findings",
   "mitigation": "concise reusable recommendation",
   "edits": [
@@ -310,6 +371,102 @@ and its final item must exactly equal file. Classify SKILL.md as orchestration,
 not reviewer behavior. Use an empty edits array when no safe automated edit can
 be proposed or when the execution path cannot prove an edit will affect the
 review behavior.`;
+
+const CODE_READING_KNOWLEDGE_PROMPT = `Build a focused code-reading knowledge graph
+for the unsupported or ambiguous review comments in missed-findings.json.
+
+Read initial-analysis.json, pr.json, files.json, diff.patch,
+analysis-snapshots.json, missed-findings.json, skill-review.json, and existing
+applicable knowledge under skill/Reviewers/CodeReading. Read the product source
+only from the read-only historical repository path in
+repository-context.json. That checkout is pinned to the exact reviewed commit.
+Do not access remotes, websites, network APIs, other checkouts, branches, tags,
+or later commits. Do not modify files.
+
+Identify the functions, methods, classes, structures, or modules needed to
+resolve the disputed technical claim. For every central symbol, establish:
+1. where it is used and why it exists;
+2. similar symbols, including their meaningful behavioral differences;
+3. inputs, types, possible and valid values, outputs, expected values, and the
+   consequences of swallowed, translated, retried, or propagated errors;
+4. classes, structures, static methods, services, caches, stores, and APIs it
+   uses, and the ownership/data/control-flow relationships between them;
+5. call flow, invariants, source-of-truth contracts, and concrete evidence;
+6. remaining uncertainty that the checked-out source cannot resolve.
+
+Classify the gap type, such as missing call-path context, contract ambiguity,
+source-of-truth confusion, lifecycle/state-machine gap, error-propagation gap,
+or similar-API confusion. Refresh stale existing knowledge rather than trusting
+it when its commit or evidence differs.
+
+Return only valid JSON:
+{
+  "summary": "what the repository investigation established",
+  "gapType": "concise knowledge-gap classification",
+  "symbols": [
+    {
+      "name": "exact symbol name",
+      "kind": "function | class | structure | method | module | other",
+      "sourcePath": "repository-relative source path",
+      "purpose": "why this symbol exists",
+      "usages": ["usage, caller, and rationale"],
+      "similarSymbols": [
+        {
+          "name": "related symbol",
+          "sourcePath": "repository-relative path",
+          "similarities": "shared behavior",
+          "differences": "contract or lifecycle differences"
+        }
+      ],
+      "inputs": [
+        {
+          "name": "input name",
+          "type": "declared or inferred type",
+          "validValues": "possible and valid values",
+          "invalidBehavior": "behavior for invalid values or failures"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "return/output name",
+          "type": "type",
+          "expectedValues": "expected values or states",
+          "meaning": "semantic meaning"
+        }
+      ],
+      "errorBehavior": ["exception/error swallowing and consequences"],
+      "dependencies": [
+        {
+          "name": "dependency symbol",
+          "kind": "class, structure, method, service, cache, or API",
+          "relationship": "ownership, data flow, or control flow"
+        }
+      ],
+      "callFlow": ["ordered call-flow step"],
+      "invariants": ["contract or invariant"],
+      "evidence": ["source path, symbol, and concrete observation"],
+      "uncertainties": ["remaining unresolved question"]
+    }
+  ]
+}
+
+Include only symbols that materially help adjudicate the comment.`;
+
+const SKILL_ANALYSIS_RECHECK_PROMPT = `${SKILL_ANALYSIS_PROMPT}
+
+This is the mandatory second adjudication pass. The first-pass result is in
+initial-analysis.json. A repository-backed knowledge graph is in
+code-reading-knowledge.json and its generated skill files are listed in
+generated-knowledge-files.json. The exact read-only historical checkout is
+described by repository-context.json and is available for verification.
+
+Reassess every initially unsupported or ambiguous claim from scratch using the
+strengthened code-reading knowledge. Explicitly state whether the verdict
+changed and why. A supported final verdict may propose normal skill mitigation
+edits, but generated Reviewers/CodeReading knowledge files are evidence inputs,
+not mitigation-edit targets. If the final verdict remains unsupported or
+ambiguous, keep edits empty and make escalation identify the remaining disputed
+contract or missing evidence.`;
 
 const GROUND_TRUTH_NORMALIZATION_PROMPT = `Convert the credited human review
 comments in human-comments.json into standalone defect assertions for evaluating
@@ -666,7 +823,7 @@ async function runCopilotJson(options: {
     options.contextTier,
     "--reasoning-effort",
     "medium",
-    ...localOnlyCopilotPermissionArgs(mcpServerNames),
+    ...localOnlyCopilotPermissionArgs(mcpServerNames, { sandbox: false }),
     "--no-color",
     "--stream",
     "off",
@@ -788,12 +945,13 @@ export async function runCopilotReview(options: {
   contextTier: string;
   skillRoot?: string;
   skillName?: string;
+  triggerInstruction?: string | null;
   repositoryRoot?: string;
   usagePath: string;
 }) {
   return runReviewJsonWithRetry(
     { ...options, fullToolAccess: true },
-    reviewPrompt(options.skillName),
+    reviewPrompt(options.skillName, options.triggerInstruction),
     "Review",
   );
 }
@@ -824,10 +982,14 @@ function quoteNativeWzReviewTextScalars(raw: string) {
 }
 
 export function parseNativeWzReviewResult(raw: string) {
-  return parseYaml(quoteNativeWzReviewTextScalars(raw)) as Record<
-    string,
-    unknown
-  >;
+  try {
+    return parseYaml(raw) as Record<string, unknown>;
+  } catch {
+    return parseYaml(quoteNativeWzReviewTextScalars(raw)) as Record<
+      string,
+      unknown
+    >;
+  }
 }
 
 export function nativeWzReviewPrompt(options: {
@@ -836,16 +998,56 @@ export function nativeWzReviewPrompt(options: {
   sourceCommit?: string;
   targetCommit?: string;
   diffOnly?: boolean;
+  triggerInstruction?: string | null;
 }) {
+  let command: string;
   if (options.diffOnly) {
-    return `/wz-review "${options.repositoryRoot}" "${options.outputFolder}" --diff-only`;
-  }
-  if (!options.sourceCommit || !options.targetCommit) {
+    command = `/wz-review "${options.repositoryRoot}" "${options.outputFolder}" --diff-only`;
+  } else if (!options.sourceCommit || !options.targetCommit) {
     throw new Error(
       "Native wzReview commit mode requires source and target commits",
     );
+  } else {
+    command = `/wz-review ${options.sourceCommit} "${options.outputFolder}" --base ${options.targetCommit}`;
   }
-  return `/wz-review ${options.sourceCommit} "${options.outputFolder}" --base ${options.targetCommit}`;
+  const triggerInstruction = options.triggerInstruction?.trim()
+    ? `
+
+Additional benchmark review instruction:
+${validatePersonalSkillTriggerInstruction(
+  personalSkillTriggerInstruction(options.triggerInstruction),
+)}`
+    : "";
+  return `${command}${triggerInstruction}
+
+Headless benchmark execution requirements:
+- This invocation has no interactive follow-up turn. Never launch a background agent or return while an agent is still running.
+- Launch the two independent reviewer agents in synchronous mode, in parallel when supported, and wait for both complete results before continuing.
+- Complete verification, challenge analysis, deterministic rendering, and artifact validation in this invocation.
+- Do not return until review-result.yaml and review.md both exist and satisfy the wz-review output contract. Surface a concrete error instead of reporting that work merely started.
+
+${LOCAL_ONLY_REVIEW_INSTRUCTION}`;
+}
+
+export function nativeWzReviewArtifactError(
+  output: { stdout: string; stderr: string },
+  missingArtifacts: string[],
+) {
+  const diagnostic = `${output.stdout}\n${output.stderr}`;
+  if (
+    /sandbox(?:ing)? (?:is )?(?:enabled but )?(?:is )?not supported/i.test(
+      diagnostic,
+    ) ||
+    /windows sandboxing requires basecontainer/i.test(diagnostic)
+  ) {
+    return (
+      "wzReview was blocked because Copilot sandboxing is unsupported on this " +
+      "Windows host. Windows review sandboxing requires BaseContainer; run the " +
+      "worker on a supported Windows or Linux/WSL host. Sandbox enforcement was " +
+      "not bypassed."
+    );
+  }
+  return `wzReview did not create required artifacts: ${missingArtifacts.join(", ")}`;
 }
 
 export async function runNativeWzReview(options: {
@@ -857,64 +1059,10 @@ export async function runNativeWzReview(options: {
   model: string;
   contextTier: string;
   skillRoot: string;
+  triggerInstruction?: string | null;
   usagePath: string;
 }) {
   await fs.mkdir(options.outputFolder, { recursive: true });
-  const prompt = nativeWzReviewPrompt(options);
-  const mcpServerNames = await configuredMcpServerNames([
-    options.repositoryRoot,
-    options.skillRoot,
-    options.outputFolder,
-  ]);
-  const args = [
-    "-p",
-    prompt,
-    "--model",
-    options.model,
-    "--context",
-    options.contextTier,
-    "--reasoning-effort",
-    "medium",
-    ...localOnlyCopilotPermissionArgs(mcpServerNames),
-    "--no-color",
-    "--stream",
-    "off",
-    "--silent",
-    "--usage-output-file",
-    options.usagePath,
-    "-C",
-    options.repositoryRoot,
-    "--add-dir",
-    options.skillRoot,
-    "--add-dir",
-    options.outputFolder,
-  ];
-  const startedAt = performance.now();
-  const result = await withLocalOnlyReviewPolicy(
-    {
-      settingsRoot: options.repositoryRoot,
-      writablePaths: [
-        options.outputFolder,
-        path.dirname(options.usagePath),
-      ],
-      readonlyPaths: [options.repositoryRoot, options.skillRoot],
-    },
-    (env) =>
-      runCommand("copilot", args, {
-        cwd: options.repositoryRoot,
-        timeoutMs: 90 * 60 * 1000,
-        env,
-      }),
-  );
-  const durationMs = Math.round(performance.now() - startedAt);
-  await fs.writeFile(
-    options.usagePath.replace(/-usage\.json$/i, "-output.txt"),
-    `${result.stdout}\n\n--- STDERR ---\n${result.stderr}`,
-  );
-  if (result.exitCode !== 0) {
-    throw new Error(result.stderr.trim() || "wzReview invocation failed");
-  }
-
   const requiredArtifacts = [
     "source.yaml",
     "authored.diff",
@@ -922,6 +1070,94 @@ export async function runNativeWzReview(options: {
     "review-result.yaml",
     "review.md",
   ];
+  let existingArtifactsComplete = (
+    await Promise.all(
+      requiredArtifacts.map((artifact) =>
+        fs.stat(path.join(options.outputFolder, artifact)).catch(() => null),
+      ),
+    )
+  ).every(Boolean);
+  if (
+    existingArtifactsComplete &&
+    !options.diffOnly &&
+    options.sourceCommit &&
+    options.targetCommit
+  ) {
+    const existingSource = parseYaml(
+      await fs.readFile(path.join(options.outputFolder, "source.yaml"), "utf8"),
+    ) as Record<string, unknown>;
+    existingArtifactsComplete =
+      existingSource.headSha === options.sourceCommit &&
+      existingSource.baseSha === options.targetCommit;
+  }
+  let durationMs = 0;
+  let invocationOutput = { stdout: "", stderr: "" };
+  if (!existingArtifactsComplete) {
+    const prompt = nativeWzReviewPrompt(options);
+    const mcpServerNames = await configuredMcpServerNames([
+      options.repositoryRoot,
+      options.skillRoot,
+      options.outputFolder,
+    ]);
+    const args = [
+      "-p",
+      prompt,
+      "--model",
+      options.model,
+      "--context",
+      options.contextTier,
+      "--reasoning-effort",
+      "medium",
+      ...localOnlyCopilotPermissionArgs(mcpServerNames, { sandbox: false }),
+      "--no-color",
+      "--stream",
+      "off",
+      "--silent",
+      "--usage-output-file",
+      options.usagePath,
+      "-C",
+      options.repositoryRoot,
+      "--add-dir",
+      options.skillRoot,
+      "--add-dir",
+      options.outputFolder,
+    ];
+    const startedAt = performance.now();
+    const result = await withLocalOnlyReviewPolicy(
+      {
+        settingsRoot: options.repositoryRoot,
+        writablePaths: [
+          options.outputFolder,
+          path.dirname(options.usagePath),
+        ],
+        readonlyPaths: [options.repositoryRoot, options.skillRoot],
+        sandbox: false,
+      },
+      (env) =>
+        runCommand("copilot", args, {
+          cwd: options.repositoryRoot,
+          timeoutMs: 90 * 60 * 1000,
+          env,
+        }),
+    );
+    durationMs = Math.round(performance.now() - startedAt);
+    invocationOutput = result;
+    await fs.writeFile(
+      options.usagePath.replace(/-usage\.json$/i, "-output.txt"),
+      `${result.stdout}\n\n--- STDERR ---\n${result.stderr}`,
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.trim() || "wzReview invocation failed");
+    }
+  } else {
+    invocationOutput.stdout = await fs
+      .readFile(
+        options.usagePath.replace(/-usage\.json$/i, "-output.txt"),
+        "utf8",
+      )
+      .catch(() => "Recovered completed wzReview artifacts.");
+  }
+
   const missingArtifacts = (
     await Promise.all(
       requiredArtifacts.map(async (artifact) => ({
@@ -938,7 +1174,7 @@ export async function runNativeWzReview(options: {
     .map((item) => item.artifact);
   if (missingArtifacts.length > 0) {
     throw new Error(
-      `wzReview did not create required artifacts: ${missingArtifacts.join(", ")}`,
+      nativeWzReviewArtifactError(invocationOutput, missingArtifacts),
     );
   }
 
@@ -981,6 +1217,14 @@ export async function runNativeWzReview(options: {
   } catch {
     usage = null;
   }
+  if (
+    durationMs === 0 &&
+    usage &&
+    typeof usage === "object" &&
+    typeof (usage as Record<string, unknown>).totalApiDurationMs === "number"
+  ) {
+    durationMs = (usage as Record<string, number>).totalApiDurationMs;
+  }
   const reviewFiles = await fs.readdir(
     path.join(options.outputFolder, "reviews"),
     { recursive: true },
@@ -989,7 +1233,7 @@ export async function runNativeWzReview(options: {
     output,
     durationMs,
     usage,
-    rawOutput: result.stdout,
+    rawOutput: invocationOutput.stdout,
     nativeArtifacts: {
       outputFolder: options.outputFolder,
       reviewResultPath,
@@ -1039,22 +1283,19 @@ export async function runQuickOrchestration(options: {
   );
 }
 
-export async function runCopilotSkillAnalysis(options: {
-  workspace: string;
-  model: string;
-  contextTier: string;
-  usagePath: string;
-}) {
-  const result = await runCopilotJson({
-    ...options,
-    prompt: SKILL_ANALYSIS_PROMPT,
-  });
-  const parsed = extractJson(result.rawOutput);
+export function parseSkillAnalysisOutput(rawOutput: string) {
+  const parsed = extractJson(rawOutput);
   if (!parsed || typeof parsed !== "object") {
     throw new Error("Skill analysis output JSON was not an object");
   }
   const object = parsed as Record<string, unknown>;
-  const edits = Array.isArray(object.edits)
+  const commentAssessmentStatus =
+    object.commentAssessmentStatus === "supported" ||
+    object.commentAssessmentStatus === "unsupported" ||
+    object.commentAssessmentStatus === "ambiguous"
+      ? object.commentAssessmentStatus
+      : "ambiguous";
+  const parsedEdits = Array.isArray(object.edits)
     ? object.edits
         .map((value): SkillMitigationEdit | null => {
           if (!value || typeof value !== "object") return null;
@@ -1102,14 +1343,224 @@ export async function runCopilotSkillAnalysis(options: {
         .filter((edit): edit is SkillMitigationEdit => Boolean(edit))
         .slice(0, 12)
     : [];
+  const edits =
+    commentAssessmentStatus === "supported" ? parsedEdits : [];
   const output: SkillAnalysisOutput = {
     summary: typeof object.summary === "string" ? object.summary.trim() : "",
+    commentAssessmentStatus,
+    changeAndCommentAssessment:
+      typeof object.changeAndCommentAssessment === "string"
+        ? object.changeAndCommentAssessment.trim()
+        : "",
+    assessmentEvidence: Array.isArray(object.assessmentEvidence)
+      ? object.assessmentEvidence
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .slice(0, 20)
+      : [],
+    escalation:
+      typeof object.escalation === "string" ? object.escalation.trim() : "",
+    reviewAspect:
+      typeof object.reviewAspect === "string" ? object.reviewAspect.trim() : "",
+    prevention:
+      typeof object.prevention === "string" ? object.prevention.trim() : "",
+    skillGap: typeof object.skillGap === "string" ? object.skillGap.trim() : "",
     whyMissed:
       typeof object.whyMissed === "string" ? object.whyMissed.trim() : "",
     mitigation:
       typeof object.mitigation === "string" ? object.mitigation.trim() : "",
     edits,
   };
+  return output;
+}
+
+function limitedStrings(value: unknown, limit = 20) {
+  return Array.isArray(value)
+    ? value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .slice(0, limit)
+    : [];
+}
+
+export function parseCodeReadingKnowledgeOutput(rawOutput: string) {
+  const parsed = extractJson(rawOutput);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Code-reading knowledge output JSON was not an object");
+  }
+  const object = parsed as Record<string, unknown>;
+  const symbols = Array.isArray(object.symbols)
+    ? object.symbols
+        .map((value): CodeReadingKnowledgeSymbol | null => {
+          if (!value || typeof value !== "object") return null;
+          const symbol = value as Record<string, unknown>;
+          if (
+            typeof symbol.name !== "string" ||
+            !symbol.name.trim() ||
+            typeof symbol.sourcePath !== "string" ||
+            !symbol.sourcePath.trim()
+          ) {
+            return null;
+          }
+          const kind =
+            symbol.kind === "function" ||
+            symbol.kind === "class" ||
+            symbol.kind === "structure" ||
+            symbol.kind === "method" ||
+            symbol.kind === "module" ||
+            symbol.kind === "other"
+              ? symbol.kind
+              : "other";
+          const similarSymbols = Array.isArray(symbol.similarSymbols)
+            ? symbol.similarSymbols.flatMap((item) => {
+                if (!item || typeof item !== "object") return [];
+                const related = item as Record<string, unknown>;
+                if (typeof related.name !== "string") return [];
+                return [{
+                  name: related.name.trim(),
+                  sourcePath:
+                    typeof related.sourcePath === "string"
+                      ? related.sourcePath.trim()
+                      : "",
+                  similarities:
+                    typeof related.similarities === "string"
+                      ? related.similarities.trim()
+                      : "",
+                  differences:
+                    typeof related.differences === "string"
+                      ? related.differences.trim()
+                      : "",
+                }];
+              }).slice(0, 20)
+            : [];
+          const inputs = Array.isArray(symbol.inputs)
+            ? symbol.inputs.flatMap((item) => {
+                if (!item || typeof item !== "object") return [];
+                const input = item as Record<string, unknown>;
+                if (typeof input.name !== "string") return [];
+                return [{
+                  name: input.name.trim(),
+                  type: typeof input.type === "string" ? input.type.trim() : "",
+                  validValues:
+                    typeof input.validValues === "string"
+                      ? input.validValues.trim()
+                      : "",
+                  invalidBehavior:
+                    typeof input.invalidBehavior === "string"
+                      ? input.invalidBehavior.trim()
+                      : "",
+                }];
+              }).slice(0, 30)
+            : [];
+          const outputs = Array.isArray(symbol.outputs)
+            ? symbol.outputs.flatMap((item) => {
+                if (!item || typeof item !== "object") return [];
+                const output = item as Record<string, unknown>;
+                if (typeof output.name !== "string") return [];
+                return [{
+                  name: output.name.trim(),
+                  type:
+                    typeof output.type === "string" ? output.type.trim() : "",
+                  expectedValues:
+                    typeof output.expectedValues === "string"
+                      ? output.expectedValues.trim()
+                      : "",
+                  meaning:
+                    typeof output.meaning === "string"
+                      ? output.meaning.trim()
+                      : "",
+                }];
+              }).slice(0, 20)
+            : [];
+          const dependencies = Array.isArray(symbol.dependencies)
+            ? symbol.dependencies.flatMap((item) => {
+                if (!item || typeof item !== "object") return [];
+                const dependency = item as Record<string, unknown>;
+                if (typeof dependency.name !== "string") return [];
+                return [{
+                  name: dependency.name.trim(),
+                  kind:
+                    typeof dependency.kind === "string"
+                      ? dependency.kind.trim()
+                      : "",
+                  relationship:
+                    typeof dependency.relationship === "string"
+                      ? dependency.relationship.trim()
+                      : "",
+                }];
+              }).slice(0, 30)
+            : [];
+          return {
+            name: symbol.name.trim(),
+            kind,
+            sourcePath: symbol.sourcePath.trim(),
+            purpose:
+              typeof symbol.purpose === "string" ? symbol.purpose.trim() : "",
+            usages: limitedStrings(symbol.usages, 30),
+            similarSymbols,
+            inputs,
+            outputs,
+            errorBehavior: limitedStrings(symbol.errorBehavior, 30),
+            dependencies,
+            callFlow: limitedStrings(symbol.callFlow, 40),
+            invariants: limitedStrings(symbol.invariants, 30),
+            evidence: limitedStrings(symbol.evidence, 40),
+            uncertainties: limitedStrings(symbol.uncertainties, 20),
+          };
+        })
+        .filter((symbol): symbol is CodeReadingKnowledgeSymbol =>
+          Boolean(symbol),
+        )
+        .slice(0, 12)
+    : [];
+  if (symbols.length === 0) {
+    throw new Error("Code-reading knowledge did not identify any symbols");
+  }
+  const output: CodeReadingKnowledgeOutput = {
+    summary:
+      typeof object.summary === "string" ? object.summary.trim() : "",
+    gapType:
+      typeof object.gapType === "string"
+        ? object.gapType.trim()
+        : "repository-context gap",
+    symbols,
+  };
+  return output;
+}
+
+export async function runCopilotSkillAnalysis(options: {
+  workspace: string;
+  model: string;
+  contextTier: string;
+  usagePath: string;
+  repositoryRoot?: string;
+  recheckWithKnowledge?: boolean;
+}) {
+  const result = await runCopilotJson({
+    ...options,
+    prompt: options.recheckWithKnowledge
+      ? SKILL_ANALYSIS_RECHECK_PROMPT
+      : SKILL_ANALYSIS_PROMPT,
+  });
+  const output = parseSkillAnalysisOutput(result.rawOutput);
+  return { ...result, output };
+}
+
+export async function runCopilotCodeReading(options: {
+  workspace: string;
+  model: string;
+  contextTier: string;
+  usagePath: string;
+  repositoryRoot: string;
+  skillRoot: string;
+}) {
+  const result = await runCopilotJson({
+    ...options,
+    prompt: CODE_READING_KNOWLEDGE_PROMPT,
+  });
+  const output = parseCodeReadingKnowledgeOutput(result.rawOutput);
   return { ...result, output };
 }
 
@@ -1160,18 +1611,26 @@ export async function prepareSkillRoot(
   runtimeRoot: string,
 ): Promise<string> {
   const { resolved, kind } = await validateSkillPath(configuredPath);
-  if (kind === "repository") return resolved;
-
   const skillRoot = path.join(runtimeRoot, "skill-root");
-  const destination = path.join(
-    skillRoot,
-    ".github",
-    "skills",
-    path.basename(resolved) || "user-pr-review",
-  );
   await fs.rm(skillRoot, { recursive: true, force: true });
-  await fs.mkdir(path.dirname(destination), { recursive: true });
-  await fs.cp(resolved, destination, { recursive: true });
+  if (kind === "repository") {
+    const destination = path.join(skillRoot, ".github", "skills");
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.cp(
+      path.join(resolved, ".github", "skills"),
+      destination,
+      { recursive: true },
+    );
+  } else {
+    const destination = path.join(
+      skillRoot,
+      ".github",
+      "skills",
+      path.basename(resolved) || "user-pr-review",
+    );
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.cp(resolved, destination, { recursive: true });
+  }
   return skillRoot;
 }
 

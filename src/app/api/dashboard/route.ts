@@ -10,9 +10,16 @@ export async function GET() {
       SELECT r.*,
         COUNT(CASE WHEN p.active = 1 THEN 1 END) AS pr_count,
         COALESCE(SUM(CASE WHEN p.active = 1 THEN p.valued_comment_count ELSE 0 END), 0) AS human_finding_count,
+        MIN(CASE WHEN p.active = 1 THEN p.number END) AS pr_set_oldest_pr,
+        MAX(CASE WHEN p.active = 1 THEN p.number END) AS pr_set_newest_pr,
+        MIN(CASE WHEN p.active = 1 THEN p.merged_at END) AS pr_set_oldest_date,
+        MAX(CASE WHEN p.active = 1 THEN p.merged_at END) AS pr_set_newest_date,
         scan.status AS latest_scan_status,
         scan.scanned_count AS latest_scan_scanned_count,
         scan.skipped_count AS latest_scan_skipped_count,
+        scan.eligible_count AS latest_scan_eligible_count,
+        scan.failed_count AS latest_scan_failed_count,
+        scan.failed_prs_json AS latest_scan_failed_prs_json,
         scan.newest_pr_number AS latest_scan_newest_pr,
         scan.oldest_pr_number AS latest_scan_oldest_pr,
         scan.newest_source_date AS latest_scan_newest_date,
@@ -60,5 +67,21 @@ export async function GET() {
       LIMIT 30
     `)
     .all();
-  return NextResponse.json({ repositories, runs, schedules, quickReviews });
+  const manualPrTasks = db
+    .prepare(`
+      SELECT id, repository_id, status, current_item, total_items,
+        status_message, error, created_at, completed_at
+      FROM workflow_tasks
+      WHERE kind = 'manual_pr'
+      ORDER BY id DESC
+      LIMIT 30
+    `)
+    .all();
+  return NextResponse.json({
+    repositories,
+    runs,
+    schedules,
+    quickReviews,
+    manualPrTasks,
+  });
 }

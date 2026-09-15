@@ -195,9 +195,14 @@ main {
   font-size: 13px;
 }
 
+.scanFailureSummary {
+  color: var(--danger);
+  font-weight: 700;
+}
+
 .workspaceGrid {
   display: grid;
-  grid-template-columns: minmax(340px, 0.72fr) minmax(0, 1.28fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
 }
 
@@ -317,6 +322,123 @@ label small {
   accent-color: var(--accent);
 }
 
+.collectionMethodField {
+  min-width: 0;
+  margin: 0 0 17px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.collectionMethodField legend {
+  padding: 0 6px;
+  color: var(--navy);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.collectionMethodOptions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.collectionMethodOption {
+  min-width: 0;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0;
+  padding: 11px;
+  border: 1px solid #cfd2d9;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.collectionMethodOption.selected {
+  border-color: var(--accent);
+  background: #f3f6ff;
+}
+
+.collectionMethodOption input {
+  width: 15px;
+  min-height: 15px;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+.collectionMethodOption span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.collectionMethodOption small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.confirmationWords {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.confirmationWords.disabled {
+  opacity: 0.55;
+}
+
+.confirmationWordList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.confirmationWord {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: 1px solid #d8dbe2;
+  border-radius: 999px;
+  color: var(--navy);
+  background: #f7f8fa;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.confirmationWord.custom {
+  border-color: #b9c5ec;
+  background: #eef2ff;
+}
+
+.confirmationWord button {
+  width: auto;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.confirmationWordInput {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.confirmationWordInput button {
+  min-height: 43px;
+  padding-inline: 14px;
+}
+
 input,
 select {
   width: 100%;
@@ -328,6 +450,12 @@ select {
   color: var(--ink);
   background: white;
   font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .collectionMethodOptions {
+    grid-template-columns: 1fr;
+  }
 }
 
 input:focus,
@@ -408,6 +536,191 @@ input:disabled {
   border: 1px solid #ccd0d8;
   color: var(--navy);
   background: white;
+}
+
+.prNumberRangeField {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fieldLabel {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  color: var(--navy);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prNumberRangeInputs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+}
+
+.prNumberRangeField + .fieldRow {
+  margin-top: 14px;
+}
+
+.helpTooltip {
+  position: relative;
+  color: var(--danger);
+  cursor: help;
+  outline: none;
+}
+
+.helpTooltip [role="tooltip"] {
+  position: absolute;
+  z-index: 20;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  display: none;
+  width: min(320px, 75vw);
+  padding: 9px 11px;
+  transform: translateX(-50%);
+  border-radius: 7px;
+  color: white;
+  background: #172033;
+  box-shadow: 0 7px 20px rgb(15 23 42 / 24%);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.helpTooltip:hover [role="tooltip"],
+.helpTooltip:focus [role="tooltip"] {
+  display: block;
+}
+
+.screenshotImportSection {
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.screenshotImportTitle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.screenshotImportDescription {
+  margin: 9px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.screenshotUploadButton {
+  width: 100%;
+}
+
+.screenshotTaskProgress {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fafaf8;
+}
+
+.screenshotTaskProgress.status-completed {
+  border-color: #b9dfc8;
+  background: #f2fbf5;
+}
+
+.screenshotTaskProgress.status-failed {
+  border-color: #f4b4b4;
+  background: #fff5f5;
+}
+
+.screenshotPreview {
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fafaf8;
+}
+
+.screenshotPreviewHeading,
+.screenshotPreviewHeading > div {
+  display: flex;
+}
+
+.screenshotPreviewHeading {
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.screenshotPreviewHeading > div {
+  flex-direction: column;
+  gap: 3px;
+}
+
+.screenshotPreviewHeading span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.screenshotFileResults {
+  display: grid;
+  gap: 5px;
+  margin-top: 12px;
+}
+
+.screenshotFileResults div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.screenshotFileResults em {
+  text-align: right;
+  font-style: normal;
+}
+
+.screenshotFileResults .hasError {
+  color: var(--danger);
+}
+
+.screenshotPrGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.screenshotPrOption {
+  min-height: 40px;
+  margin: 0;
+  padding: 8px 10px;
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #dfe2e7;
+  border-radius: 7px;
+  background: white;
+}
+
+.screenshotPrOption input {
+  width: 15px;
+  min-height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.screenshotPrOption em {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 400;
 }
 
 .prerequisite {
@@ -501,6 +814,34 @@ code {
 
 .datasetProgress {
   padding: 11px 0 2px;
+}
+
+.scanCurrentPrs {
+  margin: 7px 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.scanRangeActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 5px;
+}
+
+.scanRangeActions > span {
+  width: 100%;
+  color: var(--muted);
+}
+
+.scanRangeActions .secondaryButton {
+  min-height: 30px;
+}
+
+.collectionCancelButton {
+  margin-top: 10px;
 }
 
 .repositoryCard > p {
@@ -1053,8 +1394,27 @@ footer {
 .configurationForm select,
 .configurationForm button,
 .skillConfigurationForm input,
+.skillConfigurationForm select,
 .skillConfigurationForm button {
   min-height: 38px;
+}
+
+.fixedExecutionMode {
+  display: flex;
+  min-height: 38px;
+  padding: 8px 11px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  border: 1px solid #d8dde6;
+  border-radius: 7px;
+  color: #293241;
+  background: #f6f8fb;
+  font-size: 11px;
+}
+
+.fixedExecutionMode span {
+  color: var(--muted);
 }
 
 .configurationHint,
@@ -1123,8 +1483,91 @@ footer {
   white-space: nowrap;
 }
 
+.skillTriggerPanel {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 8px;
+  margin-top: 2px;
+  padding: 11px;
+  border: 1px solid #d8dde6;
+  border-radius: 7px;
+  background: #f6f8fb;
+}
+
+.skillTriggerHeading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.skillTriggerHeading small {
+  white-space: normal;
+}
+
+.skillTriggerPanel p {
+  margin: 0;
+  color: #293241;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.skillTriggerPanel textarea {
+  width: 100%;
+  min-height: 92px;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.45;
+}
+
+.skillTriggerPanel code {
+  display: block;
+  padding: 10px;
+  border-radius: 6px;
+  color: #dbe7f3;
+  background: var(--navy);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.skillTriggerCommandLabel {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.skillTriggerActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.skillTriggerActions span {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.skillTriggerPanel .skillTriggerSafety {
+  overflow: visible;
+  white-space: normal;
+}
+
 .actionPanel {
   padding: 20px;
+}
+
+.reviewActionSections {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  flex-wrap: wrap;
 }
 
 .reviewActionGroup {
@@ -1138,6 +1581,30 @@ footer {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #fafbfc;
+}
+
+.knowledgeGraphAction {
+  max-width: 520px;
+  margin-left: auto;
+  justify-content: flex-end;
+}
+
+.knowledgeGraphToggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 310px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.knowledgeGraphToggle input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  accent-color: var(--accent);
 }
 
 .reviewActionTitle {
@@ -1163,6 +1630,48 @@ footer {
   min-height: 36px;
   padding: 0 14px;
   font-size: 11px;
+}
+
+.trainingActionButton {
+  flex: none;
+  min-height: 36px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.trainingProgressButton {
+  min-height: 36px;
+  white-space: nowrap;
+}
+
+.trainingProgressModal {
+  width: min(1100px, 100%);
+}
+
+.trainingProgressBody {
+  display: block;
+}
+
+.trainingProgressTable th,
+.trainingProgressTable td {
+  vertical-align: top;
+}
+
+.trainingProgressTable th:first-child,
+.trainingProgressTable td:first-child,
+.trainingProgressTable th:nth-child(4),
+.trainingProgressTable td:nth-child(4),
+.trainingProgressTable th:nth-child(5),
+.trainingProgressTable td:nth-child(5) {
+  white-space: nowrap;
+}
+
+.trainingProgressTable td small {
+  display: block;
+  max-width: 480px;
+  margin-top: 4px;
+  color: var(--danger);
+  white-space: normal;
 }
 
 .reviewConcurrency {
@@ -1313,7 +1822,8 @@ footer {
   font-weight: 800;
 }
 
-.prTableFilters input {
+.prTableFilters input,
+.prTableFilters select {
   min-height: 38px;
   padding: 7px 10px;
   border: 1px solid var(--line);
@@ -1321,6 +1831,20 @@ footer {
   color: var(--ink);
   background: white;
   font: inherit;
+}
+
+.prTableFilters .prSelectionMethodField select {
+  width: 180px;
+}
+
+.prFilterSeparator {
+  width: 1px;
+  height: 58px;
+  align-self: center;
+  margin: 0 14px;
+  overflow: hidden;
+  color: transparent;
+  background: var(--line);
 }
 
 .prTableFilters input[type="search"] {
@@ -1380,6 +1904,23 @@ footer {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+.prHiddenNotice {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin: -2px 0 12px;
+  padding: 9px 12px;
+  border: 1px solid #f0c36c;
+  border-radius: 8px;
+  color: #754b00;
+  background: #fff8df;
+  font-size: 12px;
+}
+
+.prHiddenNotice span {
+  color: #59461f;
 }
 
 .prTablePagination button {
@@ -1549,22 +2090,6 @@ footer {
   gap: 10px;
 }
 
-.analyzeAllButton {
-  padding: 4px 7px;
-  border: 1px solid #8bc7c1;
-  border-radius: 5px;
-  color: var(--teal);
-  background: #eff9f7;
-  font-size: 8px;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
-.analyzeAllButton:disabled {
-  cursor: not-allowed;
-  opacity: 0.48;
-}
-
 .legacyGroupHeader {
   box-shadow: inset 0 3px 0 #b7bbc3;
 }
@@ -1686,6 +2211,99 @@ footer {
   place-items: center;
   padding: 28px;
   background: rgba(23, 25, 31, 0.58);
+}
+
+.confirmationBackdrop {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(15 23 42 / 62%);
+  backdrop-filter: blur(3px);
+}
+
+.confirmationDialog {
+  width: min(520px, 100%);
+  overflow: hidden;
+  border: 2px solid var(--teal);
+  border-radius: 16px;
+  background: #f7fffd;
+  box-shadow: 0 28px 90px rgb(15 23 42 / 38%);
+}
+
+.confirmationDialog > header {
+  padding: 22px 24px 18px;
+  color: #073b36;
+  background: linear-gradient(135deg, #d9f5ef, #eefbf8);
+  border-bottom: 1px solid #9ed8ce;
+}
+
+.confirmationDialog > header h2 {
+  margin: 6px 0 0;
+  font-size: 24px;
+}
+
+.confirmationDialog .eyebrow {
+  color: var(--teal);
+}
+
+.confirmationBody {
+  padding: 24px;
+  color: var(--ink);
+  background: #fff;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.confirmationBody p {
+  margin: 0;
+}
+
+.confirmationDialog > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 24px;
+  border-top: 1px solid #cde7e2;
+  background: #eef8f6;
+}
+
+.confirmationDialog > footer button {
+  min-height: 42px;
+  padding: 0 18px;
+  border-radius: 8px;
+  font-weight: 800;
+}
+
+.confirmation-danger {
+  border-color: #e36a5c;
+}
+
+.confirmation-danger > header {
+  color: #6f1d16;
+  background: linear-gradient(135deg, #ffe0da, #fff3ef);
+  border-bottom-color: #f0aca2;
+}
+
+.confirmation-danger .eyebrow {
+  color: var(--red);
+}
+
+.confirmation-danger > footer {
+  border-top-color: #f3c4bd;
+  background: #fff3ef;
+}
+
+.dangerConfirmButton {
+  border: 1px solid var(--red);
+  color: #fff;
+  background: var(--red);
+}
+
+.dangerConfirmButton:hover {
+  filter: brightness(0.92);
 }
 
 .defectModal {
@@ -2348,6 +2966,10 @@ footer {
   .prTableFilters,
   .prTablePagination {
     flex-wrap: wrap;
+  }
+
+  .prFilterSeparator {
+    display: none;
   }
 }
 

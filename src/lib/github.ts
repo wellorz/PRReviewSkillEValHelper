@@ -2,6 +2,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { getDb } from "@/lib/db";
 import {
+  normalizeCollectionMode,
+  selectionLevelForMode,
+} from "@/lib/collection-policy";
+import {
   findReusablePullRequests,
   type ExistingDatasetPullRequest,
 } from "@/lib/dataset-preservation";
@@ -11,6 +15,8 @@ import { runCommand } from "@/lib/process";
 import {
   parsePathFilters,
   pathMatchesFilters,
+  prCreatedOnOrBefore,
+  prNumberMatchesRange,
   reviewableChangedFilePaths,
 } from "@/lib/repository-source";
 import {
@@ -22,6 +28,7 @@ import {
   scanScope,
   type ScanCandidate,
 } from "@/lib/scan-ledger";
+import { WorkflowCancellationError } from "@/lib/workflow-cancellation";
 import type {
   GithubPullRequest,
   HumanFinding,
@@ -218,6 +225,124 @@ export async function collectPullRequestSnapshot(
   return publicPr;
 }
 
+export async function collectPullRequestBenchmarkSnapshot(
+  repository: RepositoryRecord,
+  number: number,
+  destination: string,
+) {
+  if (repository.provider === "azure-devops") {
+    const { collectAzurePullRequestBenchmarkSnapshot } = await import(
+      "@/lib/azure-devops"
+    );
+    return collectAzurePullRequestBenchmarkSnapshot(
+      repository,
+      number,
+      destination,
+    );
+  }
+
+  await checkGithubAuthentication();
+  const filters = parsePathFilters(repository.path_filter);
+  const [pr, reviewComments, issueComments, reviews, files, diff] =
+    await Promise.all([
+      ghSingle<GithubPullRequest>(`repos/${repository.slug}/pulls/${number}`),
+      ghJson<GithubComment[]>(
+        `repos/${repository.slug}/pulls/${number}/comments?per_page=100`,
+      ),
+      ghJson<GithubComment[]>(
+        `repos/${repository.slug}/issues/${number}/comments?per_page=100`,
+      ),
+      ghJson<GithubComment[]>(
+        `repos/${repository.slug}/pulls/${number}/reviews?per_page=100`,
+      ),
+      ghJson<GithubFile[]>(
+        `repos/${repository.slug}/pulls/${number}/files?per_page=100`,
+      ),
+      ghDiff(repository.slug, number),
+    ]);
+  if (!pr.merged_at || pr.draft || isBot(pr.user.login, pr.user.type)) {
+    return null;
+  }
+  const matchingFiles = filterGithubFiles(files, filters);
+  if (matchingFiles.length === 0) return null;
+
+  let findings = [
+    ...reviewComments
+      .map((comment) =>
+        toHumanFinding(comment, "review_comment", pr.user.login),
+      )
+      .filter((finding): finding is HumanFinding => Boolean(finding)),
+    ...(filters.length === 0
+      ? issueComments
+          .map((comment) =>
+            toHumanFinding(comment, "issue_comment", pr.user.login),
+          )
+          .filter((finding): finding is HumanFinding => Boolean(finding))
+      : []),
+    ...(filters.length === 0
+      ? reviews
+          .filter((review) => review.state !== "APPROVED")
+          .map((comment) => toHumanFinding(comment, "review", pr.user.login))
+          .filter((finding): finding is HumanFinding => Boolean(finding))
+      : []),
+  ];
+  if (!findings.some((finding) => finding.scorePoint === 1)) return null;
+
+  const reviewablePaths = new Set(
+    reviewableChangedFilePaths(
+      files.map((file) => file.filename),
+      findings
+        .filter((finding) => (finding.scorePoint ?? 1) === 1)
+        .map((finding) => finding.path),
+      filters,
+    ),
+  );
+  const reviewableFiles = files.filter((file) =>
+    reviewablePaths.has(file.filename),
+  );
+  const publicPr = {
+    number: pr.number,
+    title: pr.title,
+    url: pr.html_url,
+    body: pr.body,
+    author: pr.user.login,
+    base: pr.base,
+    head: pr.head,
+    mergedAt: pr.merged_at,
+    updatedAt: pr.updated_at,
+    additions: pr.additions ?? 0,
+    deletions: pr.deletions ?? 0,
+    changedFiles: reviewableFiles.length,
+  };
+  const scopedDiff = filters.length
+    ? filteredGithubDiff(reviewableFiles)
+    : diff;
+  findings = await normalizeHumanFindings({
+    repository,
+    prNumber: pr.number,
+    prMetadata: publicPr,
+    diff: scopedDiff,
+    findings,
+  });
+  await fs.mkdir(destination, { recursive: true });
+  await Promise.all([
+    fs.writeFile(
+      path.join(destination, "pr.json"),
+      JSON.stringify(publicPr, null, 2),
+    ),
+    fs.writeFile(
+      path.join(destination, "human-findings.json"),
+      JSON.stringify(findings, null, 2),
+    ),
+    fs.writeFile(
+      path.join(destination, "files.json"),
+      JSON.stringify(reviewableFiles, null, 2),
+    ),
+    fs.writeFile(path.join(destination, "diff.patch"), scopedDiff),
+  ]);
+  return { metadata: publicPr, findings };
+}
+
 function toHumanFinding(
   comment: GithubComment,
   source: HumanFinding["source"],
@@ -256,18 +381,22 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
   }
   await checkGithubAuthentication();
   const db = getDb();
-  db.prepare(
-    "UPDATE repositories SET status = 'syncing', status_message = ?, scan_current = 0, scan_total = ?, collected_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+  const started = db.prepare(
+    "UPDATE repositories SET status = 'syncing', status_message = ?, scan_current = 0, scan_total = ?, scan_current_prs = NULL, collected_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'queued'",
   ).run("Scanning recent pull requests", repository.scan_limit, repository.id);
+  if (started.changes === 0) throw new WorkflowCancellationError();
 
   const root = repositoryDatasetDir(repository.slug);
   await fs.mkdir(root, { recursive: true });
   const filters = parsePathFilters(repository.path_filter);
+  const collectionMode = normalizeCollectionMode(repository.collection_mode);
+  const selectLevel = selectionLevelForMode(collectionMode);
   const scope = scanScope(repository, filters);
   const scanRunId = beginDatasetScan(repository, scope);
   const existing = db
     .prepare(`
-      SELECT id, number, dataset_path, defect_description, url
+      SELECT id, number, dataset_path, defect_description, url, select_level,
+        source_created_at
       FROM pull_requests
       WHERE repository_id = ? AND manual = 0 AND excluded_by_user = 0
     `)
@@ -283,22 +412,31 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
         .all(repository.id) as Array<{ number: number }>
     ).map((row) => row.number),
   );
-  const preserved = await findReusablePullRequests(existing, filters);
-  const preserveExisting = db.transaction(() => {
-    db.prepare(
-      "UPDATE pull_requests SET active = 0 WHERE repository_id = ? AND manual = 0",
-    ).run(repository.id);
+  const preserved = await findReusablePullRequests(
+    existing,
+    filters,
+    selectLevel,
+    repository.pr_created_before,
+  );
+  const reactivateExisting = db.transaction(() => {
     const reactivate = db.prepare(
       "UPDATE pull_requests SET active = 1 WHERE id = ?",
     );
     for (const pullRequest of preserved) reactivate.run(pullRequest.id);
   });
-  preserveExisting();
+  reactivateExisting();
   let saved = preserved.length;
   let scanned = 0;
   let page = 1;
   const preservedNumbers = new Set(
     preserved.map((pullRequest) => pullRequest.number),
+  );
+  const higherSelectionLevelNumbers = new Set(
+    existing
+      .filter(
+        (pullRequest) => (pullRequest.select_level ?? 0) > selectLevel,
+      )
+      .map((pullRequest) => pullRequest.number),
   );
   db.prepare(
     "UPDATE repositories SET status_message = ?, collected_count = ? WHERE id = ?",
@@ -319,6 +457,19 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
 
     for (const listPr of prs) {
       if (saved >= repository.target_prs || scanned >= repository.scan_limit) break;
+      if (
+        !prCreatedOnOrBefore(
+          listPr.created_at,
+          repository.pr_created_before,
+        ) ||
+        !prNumberMatchesRange(
+          listPr.number,
+          repository.pr_number_greater_than,
+          repository.pr_number_less_than,
+        )
+      ) {
+        continue;
+      }
       scanned += 1;
       const scanCandidate: ScanCandidate = {
         number: listPr.number,
@@ -327,6 +478,7 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
       };
       if (
         preservedNumbers.has(listPr.number) ||
+        higherSelectionLevelNumbers.has(listPr.number) ||
         excludedNumbers.has(listPr.number)
       ) {
         continue;
@@ -342,10 +494,11 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
       }
 
       db.prepare(
-        "UPDATE repositories SET status_message = ?, scan_current = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE repositories SET status_message = ?, scan_current = ?, scan_current_prs = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       ).run(
         `Inspecting PR #${listPr.number}`,
         scanned,
+        `PR #${listPr.number}`,
         saved,
         repository.id,
       );
@@ -421,6 +574,7 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
         base: pr.base,
         head: pr.head,
         mergedAt: pr.merged_at,
+        createdAt: pr.created_at,
         updatedAt: pr.updated_at,
         additions: pr.additions ?? 0,
         deletions: pr.deletions ?? 0,
@@ -461,9 +615,9 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
       db.prepare(`
         INSERT INTO pull_requests (
           repository_id, number, title, url, author, base_ref, head_ref,
-          merged_at, updated_at, additions, deletions, changed_files,
-          valued_comment_count, dataset_path, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          merged_at, source_created_at, updated_at, additions, deletions, changed_files,
+          valued_comment_count, dataset_path, raw_json, select_level
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(repository_id, number) DO UPDATE SET
           title = excluded.title,
           url = excluded.url,
@@ -471,6 +625,7 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
           base_ref = excluded.base_ref,
           head_ref = excluded.head_ref,
           merged_at = excluded.merged_at,
+          source_created_at = excluded.source_created_at,
           updated_at = excluded.updated_at,
           additions = excluded.additions,
           deletions = excluded.deletions,
@@ -478,6 +633,7 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
           valued_comment_count = excluded.valued_comment_count,
           dataset_path = excluded.dataset_path,
           raw_json = excluded.raw_json,
+          select_level = MAX(pull_requests.select_level, excluded.select_level),
           active = CASE
             WHEN pull_requests.excluded_by_user = 1 THEN 0
             ELSE 1
@@ -491,6 +647,7 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
         pr.base.ref,
         pr.head.ref,
         pr.merged_at,
+        pr.created_at,
         pr.updated_at,
         pr.additions ?? 0,
         pr.deletions ?? 0,
@@ -498,6 +655,7 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
         findingCount,
         datasetPath,
         JSON.stringify(publicPr),
+        selectLevel,
       );
       recordScanOutcome(
         scanRunId,
@@ -527,6 +685,10 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
         repository: repository.slug,
         provider: repository.provider,
         pathFilter: repository.path_filter,
+        collectionMode,
+        prNumberGreaterThan: repository.pr_number_greater_than,
+        prNumberLessThan: repository.pr_number_less_than,
+        prCreatedBefore: repository.pr_created_before,
         generatedAt: new Date().toISOString(),
         scanRunId,
         scannedPullRequests: scanned,
@@ -537,9 +699,9 @@ export async function syncRepositoryDataset(repository: RepositoryRecord) {
     ),
   );
   db.prepare(
-    "UPDATE repositories SET status = 'ready', status_message = ?, scan_current = ?, scan_total = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE repositories SET status = 'ready', status_message = ?, scan_current = ?, scan_total = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'syncing'",
   ).run(
-    `Collected ${saved} PRs after scanning ${scanned}`,
+    `Collected ${saved} PRs after scanning ${scanned} in-range candidates`,
     scanned,
     scanned,
     saved,

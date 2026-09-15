@@ -6,6 +6,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import Link from "next/link";
@@ -26,6 +27,11 @@ import {
   parsePathFilters,
   pathMatchesFilters,
 } from "@/lib/repository-source";
+import {
+  MAX_PERSONAL_SKILL_TRIGGER_LENGTH,
+  personalSkillTriggerInstruction,
+} from "@/lib/personal-skill-trigger";
+import { isNativeWzReviewPath } from "@/lib/personal-skill-execution";
 
 type Repository = {
   id: number;
@@ -36,7 +42,9 @@ type Repository = {
   model: string;
   model_secondary: string;
   context_tier: string;
+  status: string;
   baseline_concurrency: number;
+  build_knowledge_graph: number;
   local_repo_path: string | null;
   local_repo_branch: string | null;
   local_repo_warning: string | null;
@@ -54,6 +62,8 @@ type PersonalSkill = {
   id: number;
   name: string;
   path: string;
+  trigger_instruction: string;
+  execution_mode: "copilot-skill" | "devloop-local";
 };
 
 type NormalizedResult = {
@@ -107,6 +117,17 @@ type SkillAnalysisJob = {
 
 type AnalysisDetails = {
   summary: string;
+  commentAssessmentStatus?: "supported" | "unsupported" | "ambiguous";
+  initialCommentAssessmentStatus?: "supported" | "unsupported" | "ambiguous";
+  knowledgeRecheckPerformed?: boolean;
+  knowledgeGraphSummary?: string;
+  knowledgeGraphFiles?: string[];
+  changeAndCommentAssessment?: string;
+  assessmentEvidence?: string[];
+  escalation?: string;
+  reviewAspect?: string;
+  prevention?: string;
+  skillGap?: string;
   whyMissed: string;
   mitigation: string;
   edits: Array<{
@@ -129,6 +150,7 @@ type PullRequest = {
   changed_paths: string[];
   available_points: number;
   valued_comment_count: number;
+  select_level: number;
   selected: number;
   manual: number;
   defect_description: string | null;
@@ -156,6 +178,33 @@ type Task = {
   created_at: string;
 };
 
+type SkillTrainingJob = {
+  id: number;
+  skill_id: number;
+  skill_name: string;
+  status: string;
+  current_iteration: number;
+  max_iterations: number;
+  current_item: number;
+  total_items: number;
+  current_pr_ids_json: string;
+  status_message: string;
+  history_json: string;
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
+  pr_progress: Array<{
+    pullRequestId: number;
+    number: number;
+    title: string;
+    status: string;
+    retries: number;
+    earned: number | null;
+    available: number | null;
+    error: string | null;
+  }>;
+};
+
 type BaselineSummary = AggregateSummary & { profileId: number };
 type SkillSummary = AggregateSummary & {
   skillId: number;
@@ -174,6 +223,7 @@ type Workspace = {
   skillResults: NormalizedResult[];
   skillAnalysisResults: SkillAnalysis[];
   skillAnalysisJobs: SkillAnalysisJob[];
+  skillTrainingJobs: SkillTrainingJob[];
   baselineSummaries: BaselineSummary[];
   skillSummaries: SkillSummary[];
 };
@@ -183,6 +233,7 @@ type ReviewSettings = {
   modelSecondary: string;
   contextTier: "default" | "long_context";
   baselineConcurrency: number;
+  buildKnowledgeGraph: boolean;
   localRepoPath: string;
   localRepoBranch: string;
 };
@@ -335,21 +386,46 @@ function profileLabel(profile: BaselineProfile) {
 }
 
 function isNativeWzReviewSkill(skill: PersonalSkill) {
-  return skill.path.replaceAll("\\", "/").toLowerCase().endsWith("/wz-review");
+  return isNativeWzReviewPath(skill.path);
+}
+
+function isNativeDevLoopSkill(skill: PersonalSkill) {
+  return skill.execution_mode === "devloop-local";
 }
 
 function skillExecutionLabel(
   skill: PersonalSkill,
   settings: Pick<ReviewSettings, "model" | "modelSecondary" | "contextTier">,
 ) {
+  if (isNativeDevLoopSkill(skill)) {
+    return "Native DevLoop · saved internal models";
+  }
   if (isNativeWzReviewSkill(skill)) {
-    return "Native workflow · models selected internally";
+    return "Trusted native workflow · publication disabled · sandbox exception";
   }
   return `${modelLabel(settings.model)}${
     settings.modelSecondary !== "none"
       ? ` + ${modelLabel(settings.modelSecondary)}`
       : ""
   } · ${contextLabel(settings.contextTier)}`;
+}
+
+function skillInvocationPreview(
+  skill: PersonalSkill,
+  settings: Pick<ReviewSettings, "model" | "contextTier">,
+  includesRepositoryContext: boolean,
+) {
+  if (isNativeDevLoopSkill(skill)) {
+    return 'python "<frozen devloop-pr-review>\\scripts\\run_review.py" --snapshot "<exact PR snapshot>" --backend-url http://127.0.0.1:8000';
+  }
+  const prompt = isNativeWzReviewSkill(skill)
+    ? `"/wz-review <sourceCommit> \\"<outputFolder>\\" --base <targetCommit> + the saved instruction above"`
+    : `"<protected local-only benchmark prompt + the saved instruction above>"`;
+  return `copilot -p ${prompt} --model ${settings.model} --context ${settings.contextTier} --add-dir "${skill.path}"${
+    includesRepositoryContext
+      ? ' --add-dir "<detached PR head worktree>"'
+      : ""
+  }`;
 }
 
 function analysisJobPullRequestIds(job: SkillAnalysisJob) {
@@ -382,7 +458,12 @@ function skillResultFor(
       result.model_secondary === settings.modelSecondary &&
       result.context_tier === settings.contextTier,
   );
-  if (exact || !isNativeWzReviewSkill(skill)) return exact;
+  if (
+    exact ||
+    (!isNativeWzReviewSkill(skill) && !isNativeDevLoopSkill(skill))
+  ) {
+    return exact;
+  }
   return candidates.reduce<NormalizedResult | undefined>(
     (latest, result) => (!latest || result.id > latest.id ? result : latest),
     undefined,
@@ -414,13 +495,6 @@ function summarizeFilteredResults(
   );
 }
 
-function confirmRemoval(item: string) {
-  if (!window.confirm(`Remove ${item}?`)) return false;
-  return window.confirm(
-    `Confirm removal of ${item}. This is the final confirmation.`,
-  );
-}
-
 export default function RepositoryWorkspacePage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
@@ -436,6 +510,13 @@ export default function RepositoryWorkspacePage() {
   );
   const [skillName, setSkillName] = useState("");
   const [skillPath, setSkillPath] = useState("");
+  const [skillExecutionMode, setSkillExecutionMode] = useState<
+    "copilot-skill" | "devloop-local"
+  >("copilot-skill");
+  const [editingSkillTriggerId, setEditingSkillTriggerId] = useState<
+    number | null
+  >(null);
+  const [skillTriggerDraft, setSkillTriggerDraft] = useState("");
   const [skillFormMessage, setSkillFormMessage] = useState<{
     kind: "success" | "error";
     text: string;
@@ -460,6 +541,9 @@ export default function RepositoryWorkspacePage() {
   const [prSearch, setPrSearch] = useState("");
   const [prPathFilter, setPrPathFilter] = useState<string | null>(null);
   const [prPathFilterEnabled, setPrPathFilterEnabled] = useState(true);
+  const [selectionMethod, setSelectionMethod] = useState<
+    "all" | "strict_confirmed" | "resolved_comments" | "manual"
+  >("all");
   const [showSelectedOnly, setShowSelectedOnly] = useState(false);
   const [showReviewedOnly, setShowReviewedOnly] = useState(false);
   const [pageSizeInput, setPageSizeInput] = useState("20");
@@ -473,14 +557,52 @@ export default function RepositoryWorkspacePage() {
     applied: boolean;
     details: AnalysisDetails;
   } | null>(null);
+  const [trainingProgressJobId, setTrainingProgressJobId] = useState<
+    number | null
+  >(null);
+  const [confirmation, setConfirmation] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    tone: "primary" | "danger";
+    resolve: (confirmed: boolean) => void;
+  } | null>(null);
   const skillSelectionStorageKey = `repository-${id}-selected-skill-ids`;
   const profileSelectionStorageKey =
     `repository-${id}-selected-profile-ids`;
   const pathFilterStorageKey = `repository-${id}-pr-path-filter`;
   const pathFilterEnabledStorageKey =
     `repository-${id}-pr-path-filter-enabled`;
+  const selectionMethodStorageKey =
+    `repository-${id}-comparison-selection-method`;
   const showSelectedStorageKey = `repository-${id}-show-selected-prs`;
   const showReviewedStorageKey = `repository-${id}-show-reviewed-prs`;
+
+  const requestConfirmation = useCallback(
+    (options: {
+      title: string;
+      message: string;
+      confirmLabel: string;
+      tone?: "primary" | "danger";
+    }) =>
+      new Promise<boolean>((resolve) => {
+        setConfirmation({
+          ...options,
+          tone: options.tone ?? "primary",
+          resolve,
+        });
+      }),
+    [],
+  );
+
+  const settleConfirmation = useCallback(
+    (confirmed: boolean) => {
+      if (!confirmation) return;
+      setConfirmation(null);
+      confirmation.resolve(confirmed);
+    },
+    [confirmation],
+  );
 
   const persistSkillSelection = useCallback(
     (skillIds: number[]) => {
@@ -507,6 +629,16 @@ export default function RepositoryWorkspacePage() {
       setPrPathFilterEnabled(
         window.localStorage.getItem(pathFilterEnabledStorageKey) !== "false",
       );
+      const storedSelectionMethod = window.localStorage.getItem(
+        selectionMethodStorageKey,
+      );
+      if (
+        storedSelectionMethod === "strict_confirmed" ||
+        storedSelectionMethod === "resolved_comments" ||
+        storedSelectionMethod === "manual"
+      ) {
+        setSelectionMethod(storedSelectionMethod);
+      }
       setShowSelectedOnly(
         window.localStorage.getItem(showSelectedStorageKey) === "true",
       );
@@ -518,86 +650,110 @@ export default function RepositoryWorkspacePage() {
   }, [
     pathFilterEnabledStorageKey,
     pathFilterStorageKey,
+    selectionMethodStorageKey,
     showReviewedStorageKey,
     showSelectedStorageKey,
   ]);
 
-  const refresh = useCallback(async () => {
-    try {
-      const response = await fetch(`/api/repositories/${id}/workspace`, {
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error("Unable to load PR workspace");
-      const workspace = (await response.json()) as Workspace;
-      setData(workspace);
-      setReviewSettings((current) =>
-        current ?? {
-          model: workspace.repository.model,
-          modelSecondary: workspace.repository.model_secondary,
-          contextTier: workspace.repository.context_tier as
-            | "default"
-            | "long_context",
-          baselineConcurrency: workspace.repository.baseline_concurrency,
-          localRepoPath: workspace.repository.local_repo_path ?? "",
-          localRepoBranch: workspace.repository.local_repo_branch ?? "",
-        },
-      );
-      setSelectedProfileIds((current) =>
-        (() => {
-          const available = new Set(
-            workspace.baselineProfiles.map((profile) => profile.id),
-          );
-          if (current !== null) {
-            return current.filter((profileId) => available.has(profileId));
-          }
-          try {
-            const stored = JSON.parse(
-              window.localStorage.getItem(profileSelectionStorageKey) ??
-                "null",
-            ) as unknown;
-            if (Array.isArray(stored)) {
-              return stored
-                .filter((profileId): profileId is number =>
-                  Number.isInteger(profileId),
-                )
-                .filter((profileId) => available.has(profileId));
+  const refreshPromiseRef = useRef<Promise<boolean> | null>(null);
+  const refresh = useCallback(() => {
+    if (refreshPromiseRef.current) return refreshPromiseRef.current;
+    const request = (async () => {
+      try {
+        const response = await fetch(`/api/repositories/${id}/workspace`, {
+          cache: "no-store",
+        });
+        if (!response.ok) throw new Error("Unable to load PR workspace");
+        const workspace = (await response.json()) as Workspace;
+        setData(workspace);
+        setReviewSettings((current) => ({
+          model: current?.model ?? workspace.repository.model,
+          modelSecondary:
+            current?.modelSecondary ?? workspace.repository.model_secondary,
+          contextTier:
+            current?.contextTier ??
+            (workspace.repository.context_tier as
+              | "default"
+              | "long_context"),
+          baselineConcurrency:
+            current?.baselineConcurrency ??
+            workspace.repository.baseline_concurrency,
+          buildKnowledgeGraph:
+            current?.buildKnowledgeGraph ??
+            Boolean(workspace.repository.build_knowledge_graph),
+          localRepoPath:
+            current?.localRepoPath ??
+            workspace.repository.local_repo_path ??
+            "",
+          localRepoBranch:
+            current?.localRepoBranch ??
+            workspace.repository.local_repo_branch ??
+            "",
+        }));
+        setSelectedProfileIds((current) =>
+          (() => {
+            const available = new Set(
+              workspace.baselineProfiles.map((profile) => profile.id),
+            );
+            if (current !== null) {
+              return current.filter((profileId) => available.has(profileId));
             }
-          } catch {
-            // Fall back to selecting all profiles on the first visit.
-          }
-          return workspace.baselineProfiles.map((profile) => profile.id);
-        })(),
-      );
-      setSelectedSkillIds((current) =>
-        (() => {
-          const available = new Set(
-            workspace.personalSkills.map((skill) => skill.id),
-          );
-          if (current !== null) {
-            return current.filter((skillId) => available.has(skillId));
-          }
-          try {
-            const stored = JSON.parse(
-              window.localStorage.getItem(skillSelectionStorageKey) ?? "null",
-            ) as unknown;
-            if (Array.isArray(stored)) {
-              return stored
-                .filter((skillId): skillId is number =>
-                  Number.isInteger(skillId),
-                )
-                .filter((skillId) => available.has(skillId));
+            try {
+              const stored = JSON.parse(
+                window.localStorage.getItem(profileSelectionStorageKey) ??
+                  "null",
+              ) as unknown;
+              if (Array.isArray(stored)) {
+                return stored
+                  .filter((profileId): profileId is number =>
+                    Number.isInteger(profileId),
+                  )
+                  .filter((profileId) => available.has(profileId));
+              }
+            } catch {
+              // Fall back to selecting all profiles on the first visit.
             }
-          } catch {
-            // Fall back to selecting all skills on the first visit.
-          }
-          return workspace.personalSkills.map((skill) => skill.id);
-        })(),
-      );
-      return true;
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-      return false;
-    }
+            return workspace.baselineProfiles.map((profile) => profile.id);
+          })(),
+        );
+        setSelectedSkillIds((current) =>
+          (() => {
+            const available = new Set(
+              workspace.personalSkills.map((skill) => skill.id),
+            );
+            if (current !== null) {
+              return current.filter((skillId) => available.has(skillId));
+            }
+            try {
+              const stored = JSON.parse(
+                window.localStorage.getItem(skillSelectionStorageKey) ?? "null",
+              ) as unknown;
+              if (Array.isArray(stored)) {
+                return stored
+                  .filter((skillId): skillId is number =>
+                    Number.isInteger(skillId),
+                  )
+                  .filter((skillId) => available.has(skillId));
+              }
+            } catch {
+              // Fall back to selecting all skills on the first visit.
+            }
+            return workspace.personalSkills.map((skill) => skill.id);
+          })(),
+        );
+        return true;
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+        return false;
+      }
+    })();
+    refreshPromiseRef.current = request;
+    void request.finally(() => {
+      if (refreshPromiseRef.current === request) {
+        refreshPromiseRef.current = null;
+      }
+    });
+    return request;
   }, [id, profileSelectionStorageKey, skillSelectionStorageKey]);
 
   async function refreshScore() {
@@ -614,20 +770,29 @@ export default function RepositoryWorkspacePage() {
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);
     const timer = window.setInterval(() => void refresh(), 3000);
+    const refreshVisiblePage = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    window.addEventListener("focus", refreshVisiblePage);
+    document.addEventListener("visibilitychange", refreshVisiblePage);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(timer);
+      window.removeEventListener("focus", refreshVisiblePage);
+      document.removeEventListener("visibilitychange", refreshVisiblePage);
     };
   }, [refresh]);
 
   useEffect(() => {
-    if (!analysisModal) return;
+    if (!analysisModal && !confirmation) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setAnalysisModal(null);
+      if (event.key !== "Escape") return;
+      if (confirmation) settleConfirmation(false);
+      else setAnalysisModal(null);
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [analysisModal]);
+  }, [analysisModal, confirmation, settleConfirmation]);
 
   const selectedPrIds = useMemo(
     () =>
@@ -662,6 +827,14 @@ export default function RepositoryWorkspacePage() {
     return pathFilteredPullRequests.filter(
       (pr) =>
         (!showSelectedOnly || Boolean(pr.selected)) &&
+        (selectionMethod === "all" ||
+          (selectionMethod === "manual" && Boolean(pr.manual)) ||
+          (selectionMethod === "strict_confirmed" &&
+            !pr.manual &&
+            pr.select_level === 1) ||
+          (selectionMethod === "resolved_comments" &&
+            !pr.manual &&
+            pr.select_level === 0)) &&
         (!showReviewedOnly ||
           pr.baseline_status === "completed" ||
           pr.skill_status === "completed" ||
@@ -672,6 +845,7 @@ export default function RepositoryWorkspacePage() {
   }, [
     pathFilteredPullRequests,
     prSearch,
+    selectionMethod,
     showReviewedOnly,
     showSelectedOnly,
   ]);
@@ -679,6 +853,10 @@ export default function RepositoryWorkspacePage() {
     () => controlFilteredPullRequests.filter((pr) => pr.selected),
     [controlFilteredPullRequests],
   );
+  const controlHiddenPullRequests = useMemo(() => {
+    const visibleIds = new Set(controlFilteredPullRequests.map((pr) => pr.id));
+    return pathFilteredPullRequests.filter((pr) => !visibleIds.has(pr.id));
+  }, [controlFilteredPullRequests, pathFilteredPullRequests]);
   const filteredBaselineSummaries = useMemo(
     () =>
       (data?.baselineProfiles ?? []).map((profile) => ({
@@ -827,14 +1005,31 @@ export default function RepositoryWorkspacePage() {
   const activeReviewTasks = activeTasks.filter(
     (task) => task.kind === "baseline" || task.kind === "skill_eval",
   );
+  const activeTrainingJobs =
+    data?.skillTrainingJobs.filter((job) =>
+      ["queued", "running", "cancelling"].includes(job.status),
+    ) ?? [];
+  const activeTrainingJob = activeTrainingJobs[0];
+  const latestTrainingJob = data?.skillTrainingJobs[0];
+  const trainingProgressJob =
+    data?.skillTrainingJobs.find(
+      (job) => job.id === trainingProgressJobId,
+    ) ?? null;
   const selectionLocked =
-    activeReviewTasks.length > 0 || busy === "evaluate";
+    activeReviewTasks.length > 0 ||
+    activeTrainingJobs.length > 0 ||
+    busy === "evaluate" ||
+    busy === "train-personal-skill";
   const configurationLocked = selectionLocked;
   const activeAnalysisJobs =
     data?.skillAnalysisJobs.filter((job) =>
       ["queued", "running"].includes(job.status),
     ) ?? [];
-  const prioritizedActiveTasks = [...activeTasks, ...activeAnalysisJobs].sort(
+  const prioritizedActiveTasks = [
+    ...activeTasks,
+    ...activeAnalysisJobs,
+    ...activeTrainingJobs,
+  ].sort(
     (left, right) =>
       new Date(right.created_at).getTime() -
       new Date(left.created_at).getTime(),
@@ -899,7 +1094,11 @@ export default function RepositoryWorkspacePage() {
       const result = await api(`/api/repositories/${id}/skills`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: skillName, path: skillPath }),
+        body: JSON.stringify({
+          name: skillName,
+          path: skillPath,
+          executionMode: skillExecutionMode,
+        }),
       });
       const skill = result.skill as PersonalSkill;
       setSelectedSkillIds((current) => {
@@ -909,6 +1108,7 @@ export default function RepositoryWorkspacePage() {
       });
       setSkillName("");
       setSkillPath("");
+      setSkillExecutionMode("copilot-skill");
       setSkillFormMessage({
         kind: "success",
         text: `Personal skill "${skill.name}" saved.`,
@@ -924,7 +1124,22 @@ export default function RepositoryWorkspacePage() {
   }
 
   async function removeSkill(skill: PersonalSkill) {
-    if (!confirmRemoval(`personal skill "${skill.name}"`)) return;
+    if (
+      !(await requestConfirmation({
+        title: "Remove personal skill?",
+        message: `Remove personal skill "${skill.name}" and its saved results?`,
+        confirmLabel: "Continue",
+        tone: "danger",
+      })) ||
+      !(await requestConfirmation({
+        title: "Final removal confirmation",
+        message: `Permanently remove personal skill "${skill.name}"?`,
+        confirmLabel: "Remove skill",
+        tone: "danger",
+      }))
+    ) {
+      return;
+    }
     setBusy(`remove-skill-${skill.id}`);
     try {
       await api(`/api/repositories/${id}/skills/${skill.id}`, {
@@ -937,6 +1152,63 @@ export default function RepositoryWorkspacePage() {
         persistSkillSelection(next);
         return next;
       });
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function editSkillTrigger(skill: PersonalSkill) {
+    setEditingSkillTriggerId(skill.id);
+    setSkillTriggerDraft(
+      personalSkillTriggerInstruction(skill.trigger_instruction),
+    );
+    setMessage(null);
+  }
+
+  async function saveSkillTrigger(skill: PersonalSkill) {
+    setBusy(`save-skill-trigger-${skill.id}`);
+    setMessage(null);
+    try {
+      const result = await api(`/api/repositories/${id}/skills/${skill.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ triggerInstruction: skillTriggerDraft }),
+      });
+      setEditingSkillTriggerId(null);
+      setSkillTriggerDraft("");
+      setMessage(
+        result.resultsInvalidated
+          ? `Trigger instruction for "${skill.name}" saved. Existing results were cleared so the next review uses it.`
+          : `Trigger instruction for "${skill.name}" is unchanged.`,
+      );
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveSkillExecutionMode(
+    skill: PersonalSkill,
+    executionMode: PersonalSkill["execution_mode"],
+  ) {
+    setBusy(`save-skill-mode-${skill.id}`);
+    setMessage(null);
+    try {
+      const result = await api(`/api/repositories/${id}/skills/${skill.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ executionMode }),
+      });
+      setMessage(
+        result.resultsInvalidated
+          ? `Execution mode for "${skill.name}" saved. Existing results were cleared.`
+          : `Execution mode for "${skill.name}" is unchanged.`,
+      );
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
@@ -1023,7 +1295,18 @@ export default function RepositoryWorkspacePage() {
 
   async function removeProfile(profile: BaselineProfile) {
     if (
-      !confirmRemoval(`baseline profile "${profileLabel(profile)}"`)
+      !(await requestConfirmation({
+        title: "Remove baseline profile?",
+        message: `Remove baseline profile "${profileLabel(profile)}" and its saved results?`,
+        confirmLabel: "Continue",
+        tone: "danger",
+      })) ||
+      !(await requestConfirmation({
+        title: "Final removal confirmation",
+        message: `Permanently remove baseline profile "${profileLabel(profile)}"?`,
+        confirmLabel: "Remove profile",
+        tone: "danger",
+      }))
     ) {
       return;
     }
@@ -1061,6 +1344,30 @@ export default function RepositoryWorkspacePage() {
         : current,
     );
     if (showMessage) setMessage("Review settings saved.");
+  }
+
+  async function updateBuildKnowledgeGraph(enabled: boolean) {
+    const next = { ...currentSettings, buildKnowledgeGraph: enabled };
+    setReviewSettings(next);
+    setBusy("knowledge-graph-setting");
+    setMessage(null);
+    try {
+      const response = await api(`/api/repositories/${id}/workspace`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+      setData((current) =>
+        current
+          ? { ...current, repository: response.repository as Repository }
+          : current,
+      );
+    } catch (error) {
+      setReviewSettings(currentSettings);
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function saveHistoryReports() {
@@ -1108,9 +1415,11 @@ export default function RepositoryWorkspacePage() {
       return;
     }
     if (
-      !window.confirm(
-        `Are you going to review the selected ${selectedPathFilteredPrIds.length} PRs for the ${skillIds.length} skills? This will also run ${profileIds.length} selected baseline profiles.`,
-      )
+      !(await requestConfirmation({
+        title: "Start PR reviews?",
+        message: `Review ${selectedPathFilteredPrIds.length} selected PRs with ${skillIds.length} personal skills and ${profileIds.length} baseline profiles.`,
+        confirmLabel: "Start reviews",
+      }))
     ) {
       return;
     }
@@ -1158,7 +1467,17 @@ export default function RepositoryWorkspacePage() {
 
   async function cancelActiveReviews() {
     if (activeReviewTasks.length === 0) return;
-    if (!window.confirm("Cancel the active PR review?")) return;
+    if (
+      !(await requestConfirmation({
+        title: "Cancel active reviews?",
+        message:
+          "Running review processes will be stopped and unfinished results will return to pending.",
+        confirmLabel: "Cancel reviews",
+        tone: "danger",
+      }))
+    ) {
+      return;
+    }
     setBusy("cancel-review");
     setMessage(null);
     try {
@@ -1171,6 +1490,84 @@ export default function RepositoryWorkspacePage() {
         ),
       );
       setMessage("PR review cancellation requested.");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function startPersonalSkillTraining() {
+    if (selectedPathFilteredPrIds.length === 0) {
+      setMessage(
+        prPathFilterEnabled
+          ? "Select at least one PR matching the path filter."
+          : "Select at least one PR.",
+      );
+      return;
+    }
+    if (selectedSkills.length !== 1) {
+      setMessage("Select exactly one Personal Skill to train.");
+      return;
+    }
+    const skill = selectedSkills[0];
+    if (
+      !(await requestConfirmation({
+        title: "Train Personal Skill?",
+        message: `Are you going to review ${selectedPathFilteredPrIds.length} selected PRs for selected Personal Skill: ${skill.name}? The local-only trainer will analyze and mitigate zero-credit gaps, then retry them for up to 5 iterations.`,
+        confirmLabel: "Train Personal Skill",
+      }))
+    ) {
+      return;
+    }
+    setBusy("train-personal-skill");
+    setMessage(null);
+    try {
+      await saveReviewSettings(false);
+      persistSkillSelection([skill.id]);
+      const result = await api(
+        `/api/repositories/${id}/skill-training`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            skillId: skill.id,
+            pullRequestIds: selectedPathFilteredPrIds,
+          }),
+        },
+      );
+      setMessage(
+        `Training queued for "${result.skillName}" on ${result.pullRequestCount} PRs with up to ${result.maxIterations} mitigation-and-retry iterations.`,
+      );
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cancelPersonalSkillTraining(job: SkillTrainingJob) {
+    if (
+      !(await requestConfirmation({
+        title: "Cancel Personal Skill training?",
+        message:
+          "Stop the active training workflow and terminate its running review or analysis process tree? Completed reviews and already-applied mitigations will be preserved.",
+        confirmLabel: "Cancel Training",
+        tone: "danger",
+      }))
+    ) {
+      return;
+    }
+    setBusy("cancel-personal-skill-training");
+    setMessage(null);
+    try {
+      await api(
+        `/api/repositories/${id}/skill-training/${job.id}/cancel`,
+        { method: "POST" },
+      );
+      setMessage(`Cancellation requested for "${job.skill_name}".`);
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
@@ -1194,8 +1591,7 @@ export default function RepositoryWorkspacePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           pullRequestIds: [pullRequestId],
-          applyPathFilter: prPathFilterEnabled,
-          pathFilter: effectivePathFilter,
+          applyPathFilter: false,
           ...(kind === "baseline"
             ? { profileIds: [configurationId] }
             : { skillIds: [configurationId] }),
@@ -1216,24 +1612,13 @@ export default function RepositoryWorkspacePage() {
   async function analyzeSkill(
     skill: PersonalSkill,
     pullRequestIds: number[],
-    applyAll = false,
     resultIds?: number[],
   ) {
     if (pullRequestIds.length === 0) {
       setMessage("This skill already has full scores for all completed PRs.");
       return;
     }
-    if (
-      applyAll &&
-      !window.confirm(
-        `Analyze ${pullRequestIds.length} missed-score PRs and apply safe mitigations to "${skill.name}"? The original files will be backed up.`,
-      )
-    ) {
-      return;
-    }
-    const key = applyAll
-      ? `analyze-apply-${skill.id}`
-      : `analyze-${skill.id}-${pullRequestIds[0]}`;
+    const key = `analyze-${skill.id}-${pullRequestIds[0]}`;
     setBusy(key);
     setMessage(null);
     try {
@@ -1241,17 +1626,13 @@ export default function RepositoryWorkspacePage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: applyAll ? "analyze_apply_all" : "analyze",
+          action: "analyze",
           skillId: skill.id,
           pullRequestIds,
           resultIds,
         }),
       });
-      setMessage(
-        applyAll
-          ? `Analyze and Apply All queued for "${skill.name}".`
-          : `Analysis queued for "${skill.name}".`,
-      );
+      setMessage(`Analysis queued for "${skill.name}".`);
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
@@ -1262,9 +1643,11 @@ export default function RepositoryWorkspacePage() {
 
   async function applyAnalysis(analysis: SkillAnalysis, skillName: string) {
     if (
-      !window.confirm(
-        `Apply the proposed mitigation to "${skillName}"? The current files will be backed up first.`,
-      )
+      !(await requestConfirmation({
+        title: "Apply skill mitigation?",
+        message: `Apply the stored proposal to "${skillName}". Current files will be backed up first.`,
+        confirmLabel: "Apply mitigation",
+      }))
     ) {
       return;
     }
@@ -1291,24 +1674,22 @@ export default function RepositoryWorkspacePage() {
     );
   }
 
-  const currentSettings = reviewSettings ?? {
+  const currentSettings: ReviewSettings = {
     model: data.repository.model,
     modelSecondary: data.repository.model_secondary,
     contextTier: data.repository.context_tier as "default" | "long_context",
     baselineConcurrency: data.repository.baseline_concurrency,
     localRepoPath: data.repository.local_repo_path ?? "",
     localRepoBranch: data.repository.local_repo_branch ?? "",
+    ...(reviewSettings ?? {}),
+    buildKnowledgeGraph: Boolean(
+      reviewSettings?.buildKnowledgeGraph ??
+        data.repository.build_knowledge_graph,
+    ),
   };
   const selectedSkills = data.personalSkills.filter((skill) =>
     (selectedSkillIds ?? []).includes(skill.id),
   );
-  const invocationPath =
-    selectedSkills.length === 1 ? selectedSkills[0].path : "<each selected skill>";
-  const invocation = `copilot -p "Review the downloaded PR snapshot and return structured findings" --model ${currentSettings.model} --context ${currentSettings.contextTier} --add-dir "${invocationPath}"${
-    data.repository.local_repo_path
-      ? ' --add-dir "<detached PR head worktree>"'
-      : ""
-  }`;
 
   return (
     <main className="prWorkspace">
@@ -1486,19 +1867,6 @@ export default function RepositoryWorkspacePage() {
             Save review settings
           </button>
         </div>
-      </section>
-
-      <section className="panel invocationPanel">
-        <div>
-          <span className="step">Skill invocation</span>
-          <p>
-            Model 1 receives each selected named skill independently.
-            {" "}Every baseline and skill receives the same detached PR-commit
-            worktree. Remote repositories and code after that commit are not
-            available to the review tools.
-          </p>
-        </div>
-        <code>{invocation}</code>
       </section>
 
       <section className="configurationGrid">
@@ -1706,6 +2074,23 @@ export default function RepositoryWorkspacePage() {
                 setSkillFormMessage(null);
               }}
             />
+            {isNativeWzReviewPath(skillPath) ? (
+              <div className="fixedExecutionMode">
+                Trusted native wz-review workflow
+              </div>
+            ) : (
+              <select
+                value={skillExecutionMode}
+                onChange={(event) =>
+                  setSkillExecutionMode(
+                    event.target.value as PersonalSkill["execution_mode"],
+                  )
+                }
+              >
+                <option value="copilot-skill">Copilot skill</option>
+                <option value="devloop-local">Native DevLoop backend</option>
+              </select>
+            )}
             <button
               className="secondaryButton"
               disabled={busy === "add-skill"}
@@ -1723,104 +2108,324 @@ export default function RepositoryWorkspacePage() {
           )}
           <p className="configurationHint">
             Enter a SKILL.md file, its containing folder, or a repository root
-            containing .github\skills.
+            containing .github\skills. Select a skill to view and edit the
+            instruction used to trigger it.
           </p>
           <div className="configurationList">
             {data.personalSkills.length === 0 && (
               <p className="configurationEmpty">Add a personal skill.</p>
             )}
-            {data.personalSkills.map((skill) => (
-              <label className="configurationItem" key={skill.id}>
-                <input
-                  type="checkbox"
-                  checked={(selectedSkillIds ?? []).includes(skill.id)}
-                  disabled={configurationLocked}
-                  onChange={(event) =>
-                    setSelectedSkillIds((current) => {
-                      const next = event.target.checked
-                        ? [...new Set([...(current ?? []), skill.id])]
-                        : (current ?? []).filter(
-                            (skillId) => skillId !== skill.id,
-                          );
-                      persistSkillSelection(next);
-                      return next;
-                    })
-                  }
-                />
-                <span>
-                  <strong>{skill.name}</strong>
-                  <small title={skill.path}>{skill.path}</small>
-                </span>
-                <button
-                  type="button"
-                  className="dangerButton"
-                  disabled={busy === `remove-skill-${skill.id}`}
-                  onClick={() => void removeSkill(skill)}
+            {data.personalSkills.map((skill) => {
+              const selected = (selectedSkillIds ?? []).includes(skill.id);
+              const editing = editingSkillTriggerId === skill.id;
+              return (
+                <div
+                  className="configurationItem skillConfigurationItem"
+                  key={skill.id}
                 >
-                  Remove
-                </button>
-              </label>
-            ))}
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${skill.name}`}
+                    checked={selected}
+                    disabled={configurationLocked}
+                    onChange={(event) =>
+                      setSelectedSkillIds((current) => {
+                        const next = event.target.checked
+                          ? [...new Set([...(current ?? []), skill.id])]
+                          : (current ?? []).filter(
+                              (skillId) => skillId !== skill.id,
+                            );
+                        if (!event.target.checked && editing) {
+                          setEditingSkillTriggerId(null);
+                          setSkillTriggerDraft("");
+                        }
+                        persistSkillSelection(next);
+                        return next;
+                      })
+                    }
+                  />
+                  <span>
+                    <strong>{skill.name}</strong>
+                    <small title={skill.path}>{skill.path}</small>
+                  </span>
+                  <button
+                    type="button"
+                    className="dangerButton"
+                    disabled={busy === `remove-skill-${skill.id}`}
+                    onClick={() => void removeSkill(skill)}
+                  >
+                    Remove
+                  </button>
+                  {selected && (
+                    <div className="skillTriggerPanel">
+                      {isNativeWzReviewSkill(skill) ? (
+                        <div className="fixedExecutionMode">
+                          <strong>Execution mode</strong>
+                          <span>
+                            Trusted native workflow · publication disabled ·
+                            sandbox exception
+                          </span>
+                        </div>
+                      ) : (
+                        <label>
+                          <strong>Execution mode</strong>
+                          <select
+                            value={skill.execution_mode}
+                            disabled={
+                              configurationLocked ||
+                              busy === `save-skill-mode-${skill.id}`
+                            }
+                            onChange={(event) =>
+                              void saveSkillExecutionMode(
+                                skill,
+                                event.target
+                                  .value as PersonalSkill["execution_mode"],
+                              )
+                            }
+                          >
+                            <option value="copilot-skill">
+                              Copilot skill
+                            </option>
+                            <option value="devloop-local">
+                              Native DevLoop backend
+                            </option>
+                          </select>
+                        </label>
+                      )}
+                      <div className="skillTriggerHeading">
+                        <div>
+                          <strong>
+                            {isNativeDevLoopSkill(skill)
+                              ? "Native DevLoop invocation"
+                              : "Editable -p instruction"}
+                          </strong>
+                          <small>
+                            {isNativeDevLoopSkill(skill)
+                              ? "The trusted evaluator host calls the frozen runner directly. No outer Copilot model is launched."
+                              : isNativeWzReviewSkill(skill)
+                              ? "Enter instruction text only. It is added after the trusted native /wz-review command."
+                              : "Enter instruction text only, not a copilot command or model/add-dir options."}
+                          </small>
+                        </div>
+                        {!isNativeDevLoopSkill(skill) && !editing && (
+                          <button
+                            type="button"
+                            className="secondaryButton compact"
+                            disabled={configurationLocked}
+                            onClick={() => editSkillTrigger(skill)}
+                          >
+                            Edit
+                          </button>
+                        )}
+                      </div>
+                      {isNativeDevLoopSkill(skill) ? (
+                        <p>
+                          DevLoop loads its saved internal reviewer models,
+                          standards, project prompts, batching, and semantic
+                          deduplication.
+                        </p>
+                      ) : editing ? (
+                        <>
+                          <textarea
+                            autoFocus
+                            maxLength={MAX_PERSONAL_SKILL_TRIGGER_LENGTH}
+                            value={skillTriggerDraft}
+                            onChange={(event) =>
+                              setSkillTriggerDraft(event.target.value)
+                            }
+                          />
+                          <div className="skillTriggerActions">
+                            <span>
+                              {skillTriggerDraft.length}/
+                              {MAX_PERSONAL_SKILL_TRIGGER_LENGTH}
+                            </span>
+                            <button
+                              type="button"
+                              className="primaryButton compact"
+                              disabled={
+                                !skillTriggerDraft.trim() ||
+                                busy === `save-skill-trigger-${skill.id}`
+                              }
+                              onClick={() => void saveSkillTrigger(skill)}
+                            >
+                              {busy === `save-skill-trigger-${skill.id}`
+                                ? "Saving..."
+                                : "Save"}
+                            </button>
+                            <button
+                              type="button"
+                              className="secondaryButton compact"
+                              disabled={
+                                busy === `save-skill-trigger-${skill.id}`
+                              }
+                              onClick={() => {
+                                setEditingSkillTriggerId(null);
+                                setSkillTriggerDraft("");
+                              }}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <p>
+                          {personalSkillTriggerInstruction(
+                            skill.trigger_instruction,
+                          )}
+                        </p>
+                      )}
+                      <span className="skillTriggerCommandLabel">
+                        Generated command shape · protected prompt abbreviated
+                      </span>
+                      <code>
+                        {skillInvocationPreview(
+                          skill,
+                          currentSettings,
+                          Boolean(data.repository.local_repo_path),
+                        )}
+                      </code>
+                      <small className="skillTriggerSafety">
+                        Local-only sandboxing, disabled credentials, and blocked
+                        publication options are always enforced outside this
+                        editable instruction.
+                      </small>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </article>
       </section>
 
       <section className="workflowActions">
         <article className="panel actionPanel">
-          <div className="reviewActionGroup">
-            <div className="reviewActionTitle">
-              <span className="step">01</span>
-              <h2>Review selected PRs</h2>
-            </div>
-            <label className="reviewConcurrency">
-              <span>Parallel reviews</span>
-              <input
-                type="number"
-                min={1}
-                max={20}
-                value={currentSettings.baselineConcurrency}
-                disabled={activeReviewTasks.length > 0}
-                onChange={(event) =>
-                  setReviewSettings({
-                    ...currentSettings,
-                    baselineConcurrency: Number(event.target.value),
-                  })
+          <div className="reviewActionSections">
+            <div className="reviewActionGroup">
+              <div className="reviewActionTitle">
+                <span className="step">01</span>
+                <h2>Review selected PRs</h2>
+              </div>
+              <label className="reviewConcurrency">
+                <span>Parallel reviews</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={currentSettings.baselineConcurrency}
+                  disabled={activeReviewTasks.length > 0}
+                  onChange={(event) =>
+                    setReviewSettings({
+                      ...currentSettings,
+                      baselineConcurrency: Number(event.target.value),
+                    })
+                  }
+                />
+              </label>
+              <button
+                className={
+                  activeReviewTasks.length > 0
+                    ? "dangerButton reviewActionButton"
+                    : "primaryButton compact reviewActionButton"
                 }
-              />
-            </label>
-            <button
-              className={
-                activeReviewTasks.length > 0
-                  ? "dangerButton reviewActionButton"
-                  : "primaryButton compact reviewActionButton"
-              }
-              disabled={
-                busy === "evaluate" ||
-                busy === "cancel-review" ||
-                Boolean(activeManualTask) ||
-                (activeReviewTasks.length === 0 &&
-                  (!currentSettings.localRepoPath.trim() ||
-                    !currentSettings.localRepoBranch.trim()))
-              }
-              onClick={() =>
-                void (activeReviewTasks.length > 0
-                  ? cancelActiveReviews()
-                  : startReview())
-              }
-            >
-              {busy === "cancel-review"
-                ? "Cancelling..."
-                : activeReviewTasks.length > 0
-                  ? "Cancel PR Review"
-                  : currentSettings.localRepoPath.trim() &&
-                      currentSettings.localRepoBranch.trim()
-                    ? "Review PR"
-                    : "Set local repository path and branch first"}
-            </button>
+                disabled={
+                  busy === "evaluate" ||
+                  busy === "cancel-review" ||
+                  Boolean(activeManualTask) ||
+                  (activeReviewTasks.length === 0 &&
+                    (!currentSettings.localRepoPath.trim() ||
+                      !currentSettings.localRepoBranch.trim()))
+                }
+                onClick={() =>
+                  void (activeReviewTasks.length > 0
+                    ? cancelActiveReviews()
+                    : startReview())
+                }
+              >
+                {busy === "cancel-review"
+                  ? "Cancelling..."
+                  : activeReviewTasks.length > 0
+                    ? "Cancel PR Review"
+                    : currentSettings.localRepoPath.trim() &&
+                        currentSettings.localRepoBranch.trim()
+                      ? "Review PR"
+                      : "Set local repository path and branch first"}
+              </button>
+            </div>
+            <div className="reviewActionGroup knowledgeGraphAction">
+              <div className="reviewActionTitle">
+                <span className="step">02</span>
+                <h2>Build Knowledge Graph</h2>
+              </div>
+              <label className="knowledgeGraphToggle">
+                <input
+                  type="checkbox"
+                  checked={currentSettings.buildKnowledgeGraph}
+                  disabled={
+                    activeReviewTasks.length > 0 ||
+                    busy === "knowledge-graph-setting" ||
+                    !currentSettings.localRepoPath.trim()
+                  }
+                  onChange={(event) =>
+                    void updateBuildKnowledgeGraph(event.target.checked)
+                  }
+                />
+                <span>
+                  {currentSettings.localRepoPath.trim()
+                    ? "Refresh local code knowledge before rechecking unsupported or ambiguous comments."
+                    : "Set Local repository path to enable repository-backed code reading."}
+                </span>
+              </label>
+              <button
+                type="button"
+                className={
+                  activeTrainingJob
+                    ? "dangerButton trainingActionButton"
+                    : "primaryButton compact trainingActionButton"
+                }
+                disabled={
+                  activeTrainingJob
+                    ? busy === "cancel-personal-skill-training" ||
+                      activeTrainingJob.status === "cancelling"
+                    : activeReviewTasks.length > 0 ||
+                      activeAnalysisJobs.length > 0 ||
+                      busy === "train-personal-skill" ||
+                      selectedSkills.length !== 1 ||
+                      selectedPathFilteredPrIds.length === 0 ||
+                      !currentSettings.localRepoPath.trim() ||
+                      !currentSettings.localRepoBranch.trim()
+                }
+                onClick={() =>
+                  void (activeTrainingJob
+                    ? cancelPersonalSkillTraining(activeTrainingJob)
+                    : startPersonalSkillTraining())
+                }
+              >
+                {busy === "cancel-personal-skill-training" ||
+                activeTrainingJob?.status === "cancelling"
+                  ? "Cancelling..."
+                  : activeTrainingJob
+                    ? "Cancel Training"
+                    : busy === "train-personal-skill"
+                      ? "Queuing..."
+                      : "Train Personal Skill"}
+              </button>
+              <button
+                type="button"
+                className="secondaryButton trainingProgressButton"
+                disabled={!latestTrainingJob}
+                onClick={() =>
+                  setTrainingProgressJobId(latestTrainingJob?.id ?? null)
+                }
+              >
+                View Progress
+              </button>
+            </div>
           </div>
           <p>
             Run selected baseline profiles and personal skills independently.
             Personal skills are scored directly against the expected defects.
+            Training runs remain local-only and retry only zero-credit PRs.
           </p>
         </article>
       </section>
@@ -1854,7 +2459,16 @@ export default function RepositoryWorkspacePage() {
       />
 
       {prioritizedActiveTasks.map((task) => (
-        <section className="panel taskProgress" key={`${"kind" in task ? "workflow" : "analysis"}-${task.id}`}>
+        <section
+          className="panel taskProgress"
+          key={`${
+            "kind" in task
+              ? "workflow"
+              : "skill_name" in task
+                ? "training"
+                : "analysis"
+          }-${task.id}`}
+        >
           <div className="progressLabel">
             <strong>{task.status_message}</strong>
             <span>
@@ -1921,6 +2535,12 @@ export default function RepositoryWorkspacePage() {
             );
             setCurrentPage(1);
           }}
+          selectionMethod={selectionMethod}
+          onSelectionMethodChange={(value) => {
+            setSelectionMethod(value);
+            window.localStorage.setItem(selectionMethodStorageKey, value);
+            setCurrentPage(1);
+          }}
           showSelectedOnly={showSelectedOnly}
           onShowSelectedOnlyChange={(value) => {
             setShowSelectedOnly(value);
@@ -1953,6 +2573,23 @@ export default function RepositoryWorkspacePage() {
           totalCount={data.pullRequests.length}
           onPageChange={setCurrentPage}
         />
+        {controlHiddenPullRequests.length > 0 && (
+          <div className="prHiddenNotice">
+            <strong>
+              Hidden by search or display filters (
+              {controlHiddenPullRequests.length}):
+            </strong>
+            <span>
+              {controlHiddenPullRequests
+                .slice(0, 10)
+                .map((pr) => `#${pr.number}`)
+                .join(", ")}
+              {controlHiddenPullRequests.length > 10
+                ? `, and ${controlHiddenPullRequests.length - 10} more`
+                : ""}
+            </span>
+          </div>
+        )}
 
         <div className="resultTableWrap">
           {data.pullRequests.length === 0 && (
@@ -1992,6 +2629,7 @@ export default function RepositoryWorkspacePage() {
                       </button>
                     </span>
                   </th>
+                  <th rowSpan={2}>SelectLevel</th>
                   {data.baselineProfiles.map((profile) => (
                     <th
                       colSpan={2}
@@ -2006,23 +2644,7 @@ export default function RepositoryWorkspacePage() {
                       </small>
                     </th>
                   ))}
-                  {selectedSkills.map((skill) => {
-                    const incompleteResults = data.pullRequests.flatMap((pr) => {
-                      const result = skillResultFor(
-                        pr,
-                        skill,
-                        currentSettings,
-                      );
-                      return result && skillHasMissedScore(result)
-                        ? [{ pullRequestId: pr.id, resultId: result.id }]
-                        : [];
-                    });
-                    const activeApplyJob = activeAnalysisJobs.find(
-                      (job) =>
-                        job.skill_id === skill.id &&
-                        job.mode === "analyze_apply",
-                    );
-                    return (
+                  {selectedSkills.map((skill) => (
                       <th
                         colSpan={3}
                         className="configurationGroupHeader skillGroupHeader"
@@ -2030,38 +2652,12 @@ export default function RepositoryWorkspacePage() {
                       >
                         <div className="skillHeaderTitle">
                           <strong>{skill.name}</strong>
-                          <button
-                            type="button"
-                            className="analyzeAllButton"
-                            disabled={
-                              Boolean(activeApplyJob) ||
-                              incompleteResults.length === 0 ||
-                              busy === `analyze-apply-${skill.id}`
-                            }
-                            onClick={() =>
-                              void analyzeSkill(
-                                skill,
-                                incompleteResults.map(
-                                  (result) => result.pullRequestId,
-                                ),
-                                true,
-                                incompleteResults.map(
-                                  (result) => result.resultId,
-                                ),
-                              )
-                            }
-                          >
-                            {activeApplyJob
-                              ? activeApplyJob.status
-                              : "Analyze and Apply All"}
-                          </button>
                         </div>
                         <small>
                           {skillExecutionLabel(skill, currentSettings)}
                         </small>
                       </th>
-                    );
-                  })}
+                    ))}
                 </tr>
                 <tr>
                   {data.baselineProfiles.map((profile) => (
@@ -2204,6 +2800,7 @@ export default function RepositoryWorkspacePage() {
                         {pr.valued_comment_count} findings
                       </small>
                     </td>
+                    <td>{pr.select_level}</td>
                     {data.baselineProfiles.map((profile) => {
                       const result = pr.baselineResults.find(
                         (item) => item.profile_id === profile.id,
@@ -2388,20 +2985,39 @@ export default function RepositoryWorkspacePage() {
                                       void analyzeSkill(
                                         skill,
                                         [pr.id],
-                                        false,
                                         [result.id],
                                       )
                                     }
                                   >
-                                    {analysis &&
-                                    ["pending", "running"].includes(
-                                      analysis.status,
-                                    )
-                                      ? analysis.status
-                                      : "Analyze"}
+                                    {busy ===
+                                    `analyze-${skill.id}-${pr.id}`
+                                      ? "Queuing..."
+                                      : activeAnalysisJob
+                                        ? activeAnalysisJob.status === "queued"
+                                          ? "Queued"
+                                          : "Running..."
+                                        : analysis &&
+                                            ["pending", "running"].includes(
+                                              analysis.status,
+                                            )
+                                          ? analysis.status === "pending"
+                                            ? "Queued"
+                                            : "Running..."
+                                          : analysis
+                                            ? "Reanalyze"
+                                            : "Analyze"}
                                   </button>
                                   <button
                                     type="button"
+                                    title={
+                                      analysis?.applied_at
+                                        ? "This mitigation has already been applied."
+                                        : activeSkillTask
+                                          ? "Wait for the active personal-skill review to finish before modifying this skill."
+                                          : !canApply
+                                            ? "This analysis does not contain an applicable mitigation proposal."
+                                            : undefined
+                                    }
                                     disabled={
                                       Boolean(analysis?.applied_at) ||
                                       !canApply ||
@@ -2415,27 +3031,25 @@ export default function RepositoryWorkspacePage() {
                                   >
                                     {analysis?.applied_at ? "Applied" : "Apply"}
                                   </button>
-                                  {analysis?.applied_at && (
-                                    <button
-                                      type="button"
-                                      className="secondaryButton"
-                                      disabled={
-                                        Boolean(activeSkillTask) ||
-                                        busy === retryKey
-                                      }
-                                      onClick={() =>
-                                        void retryResult(
-                                          "evaluate",
-                                          pr.id,
-                                          skill.id,
-                                        )
-                                      }
-                                    >
-                                      {busy === retryKey
-                                        ? "Rerunning…"
-                                        : "Rerun"}
-                                    </button>
-                                  )}
+                                  <button
+                                    type="button"
+                                    className="secondaryButton"
+                                    disabled={
+                                      Boolean(activeAnalysisJob) ||
+                                      busy === retryKey
+                                    }
+                                    onClick={() =>
+                                      void retryResult(
+                                        "evaluate",
+                                        pr.id,
+                                        skill.id,
+                                      )
+                                    }
+                                  >
+                                    {busy === retryKey
+                                      ? "Rerunning review…"
+                                      : "Rerun review"}
+                                  </button>
                                 </div>
                                 {analysisDetails && (
                                   <button
@@ -2543,6 +3157,95 @@ export default function RepositoryWorkspacePage() {
                 <h3>Summary</h3>
                 <p>{analysisModal.details.summary}</p>
               </article>
+              {analysisModal.details.changeAndCommentAssessment && (
+                <article className="modalDefectCard">
+                  <h3>Change and comment assessment</h3>
+                  {analysisModal.details.knowledgeRecheckPerformed &&
+                    analysisModal.details.initialCommentAssessmentStatus && (
+                      <p>
+                        <strong>Initial verdict:</strong>{" "}
+                        {
+                          analysisModal.details
+                            .initialCommentAssessmentStatus
+                        }
+                      </p>
+                    )}
+                  {analysisModal.details.commentAssessmentStatus && (
+                    <p>
+                      <strong>
+                        {analysisModal.details.knowledgeRecheckPerformed
+                          ? "Final verdict:"
+                          : "Verdict:"}
+                      </strong>{" "}
+                      {analysisModal.details.commentAssessmentStatus}
+                    </p>
+                  )}
+                  <p>
+                    {analysisModal.details.changeAndCommentAssessment}
+                  </p>
+                  {analysisModal.details.assessmentEvidence &&
+                    analysisModal.details.assessmentEvidence.length > 0 && (
+                      <>
+                        <h4>Evidence</h4>
+                        <ul>
+                          {analysisModal.details.assessmentEvidence.map(
+                            (evidence) => (
+                              <li key={evidence}>{evidence}</li>
+                            ),
+                          )}
+                        </ul>
+                      </>
+                    )}
+                </article>
+              )}
+              {analysisModal.details.knowledgeRecheckPerformed && (
+                <article className="modalDefectCard">
+                  <h3>Knowledge graph recheck</h3>
+                  <p>
+                    {analysisModal.details.knowledgeGraphSummary ||
+                      "Repository-backed code reading completed before the final verdict."}
+                  </p>
+                  {analysisModal.details.knowledgeGraphFiles &&
+                    analysisModal.details.knowledgeGraphFiles.length > 0 && (
+                      <>
+                        <h4>Generated files</h4>
+                        <ul>
+                          {analysisModal.details.knowledgeGraphFiles.map(
+                            (file) => (
+                              <li key={file}>
+                                <code>{file}</code>
+                              </li>
+                            ),
+                          )}
+                        </ul>
+                      </>
+                    )}
+                </article>
+              )}
+              {analysisModal.details.escalation && (
+                <article className="modalDefectCard">
+                  <h3>Human adjudication required</h3>
+                  <p>{analysisModal.details.escalation}</p>
+                </article>
+              )}
+              {analysisModal.details.reviewAspect && (
+                <article className="modalDefectCard">
+                  <h3>Review aspect</h3>
+                  <p>{analysisModal.details.reviewAspect}</p>
+                </article>
+              )}
+              {analysisModal.details.prevention && (
+                <article className="modalDefectCard">
+                  <h3>How to prevent this defect class</h3>
+                  <p>{analysisModal.details.prevention}</p>
+                </article>
+              )}
+              {analysisModal.details.skillGap && (
+                <article className="modalDefectCard">
+                  <h3>What is missing from the skill</h3>
+                  <p>{analysisModal.details.skillGap}</p>
+                </article>
+              )}
               <article className="modalDefectCard">
                 <h3>Why the skill missed it</h3>
                 <p>{analysisModal.details.whyMissed}</p>
@@ -2555,9 +3258,9 @@ export default function RepositoryWorkspacePage() {
                 <article className="modalDefectCard">
                   <h3>Exact changes made by Apply</h3>
                   <p className="analysisApplyNotice">
-                    Apply uses this stored proposal exactly. If the current text
-                    no longer matches once, Apply stops without changing the
-                    file.
+                    Apply is append-only. It preserves current file content,
+                    skips mitigation text that already exists, and appends a
+                    missing mitigation when the original anchor has changed.
                   </p>
                   <div className="analysisPatchList">
                     {analysisModal.details.edits.map((edit) => (
@@ -2574,6 +3277,7 @@ export default function RepositoryWorkspacePage() {
                               {edit.implementationPath.join(" → ")}
                             </p>
                           )}
+
                         {edit.rationale && <p>{edit.rationale}</p>}
                         <div className="analysisPatchColumns">
                           <div>
@@ -2602,6 +3306,126 @@ export default function RepositoryWorkspacePage() {
                 onClick={() => setAnalysisModal(null)}
               >
                 Close
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {trainingProgressJob && (
+        <div
+          className="defectModalBackdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setTrainingProgressJobId(null);
+            }
+          }}
+        >
+          <section
+            className="defectModal trainingProgressModal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="training-progress-title"
+          >
+            <header>
+              <div>
+                <span className="eyebrow">Personal skill training</span>
+                <h2 id="training-progress-title">Training progress</h2>
+                <p>
+                  {trainingProgressJob.skill_name} ·{" "}
+                  {trainingProgressJob.status_message}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="secondaryButton"
+                onClick={() => setTrainingProgressJobId(null)}
+              >
+                Close
+              </button>
+            </header>
+            <div className="defectModalBody trainingProgressBody">
+              <div className="tableWrap">
+                <table className="trainingProgressTable">
+                  <thead>
+                    <tr>
+                      <th>PR</th>
+                      <th>Title</th>
+                      <th>Review status</th>
+                      <th>Score</th>
+                      <th>Retries</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trainingProgressJob.pr_progress.map((progress) => (
+                      <tr key={progress.pullRequestId}>
+                        <td>#{progress.number}</td>
+                        <td>{progress.title}</td>
+                        <td>
+                          <strong>{progress.status}</strong>
+                          {progress.error && (
+                            <small>{progress.error}</small>
+                          )}
+                        </td>
+                        <td>
+                          {progress.earned === null ||
+                          progress.available === null
+                            ? "—"
+                            : `${progress.earned}/${progress.available}`}
+                        </td>
+                        <td>{progress.retries}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {confirmation && (
+        <div
+          className="confirmationBackdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              settleConfirmation(false);
+            }
+          }}
+        >
+          <section
+            className={`confirmationDialog confirmation-${confirmation.tone}`}
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="confirmation-title"
+            aria-describedby="confirmation-message"
+          >
+            <header>
+              <span className="eyebrow">Confirmation required</span>
+              <h2 id="confirmation-title">{confirmation.title}</h2>
+            </header>
+            <div className="confirmationBody">
+              <p id="confirmation-message">{confirmation.message}</p>
+            </div>
+            <footer>
+              <button
+                type="button"
+                className="secondaryButton"
+                onClick={() => settleConfirmation(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                autoFocus
+                className={
+                  confirmation.tone === "danger"
+                    ? "dangerConfirmButton"
+                    : "primaryButton"
+                }
+                onClick={() => settleConfirmation(true)}
+              >
+                {confirmation.confirmLabel}
               </button>
             </footer>
           </section>

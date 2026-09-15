@@ -28,6 +28,7 @@ type BundlePullRequest = {
   deletions: number;
   changedFiles: number;
   valuedCommentCount: number;
+  selectLevel: number;
   rawJson: string;
   selected: boolean;
   manual: boolean;
@@ -83,6 +84,7 @@ type PullRequestRow = {
   deletions: number;
   changed_files: number;
   valued_comment_count: number;
+  select_level: number;
   dataset_path: string;
   raw_json: string;
   selected: number;
@@ -145,7 +147,8 @@ export async function createPrSetBundle(db: Database.Database) {
       .prepare(`
         SELECT number, title, url, author, base_ref, head_ref, merged_at,
           updated_at, additions, deletions, changed_files,
-          valued_comment_count, dataset_path, raw_json, selected, manual,
+          valued_comment_count, select_level, dataset_path, raw_json,
+          selected, manual,
           defect_description
         FROM pull_requests
         WHERE repository_id = ? AND active = 1 AND excluded_by_user = 0
@@ -177,6 +180,7 @@ export async function createPrSetBundle(db: Database.Database) {
           deletions: pullRequest.deletions,
           changedFiles: pullRequest.changed_files,
           valuedCommentCount: pullRequest.valued_comment_count,
+          selectLevel: pullRequest.select_level,
           rawJson: pullRequest.raw_json,
           selected: Boolean(pullRequest.selected),
           manual: Boolean(pullRequest.manual),
@@ -295,6 +299,11 @@ export async function decodePrSetBundle(archive: Buffer) {
               pullRequestValue,
               "valuedCommentCount",
             ),
+            selectLevel:
+              typeof pullRequestValue.selectLevel === "number" &&
+              Number.isInteger(pullRequestValue.selectLevel)
+                ? pullRequestValue.selectLevel
+                : 0,
             rawJson: stringValue(pullRequestValue, "rawJson"),
             selected: pullRequestValue.selected !== false,
             manual: pullRequestValue.manual === true,
@@ -388,8 +397,8 @@ export async function importPrSetBundle(
         repository_id, number, title, url, author, base_ref, head_ref,
         merged_at, updated_at, additions, deletions, changed_files,
         valued_comment_count, dataset_path, raw_json, active, selected,
-        manual, excluded_by_user, defect_description
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?)
+        select_level, manual, excluded_by_user, defect_description
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0, ?)
       ON CONFLICT(repository_id, number) DO UPDATE SET
         title = excluded.title,
         url = excluded.url,
@@ -402,6 +411,7 @@ export async function importPrSetBundle(
         deletions = excluded.deletions,
         changed_files = excluded.changed_files,
         valued_comment_count = excluded.valued_comment_count,
+        select_level = excluded.select_level,
         dataset_path = excluded.dataset_path,
         raw_json = excluded.raw_json,
         active = 1,
@@ -473,6 +483,7 @@ export async function importPrSetBundle(
           item.datasetPath,
           pullRequest.rawJson,
           pullRequest.selected ? 1 : 0,
+          pullRequest.selectLevel,
           pullRequest.manual ? 1 : 0,
           pullRequest.defectDescription,
         );

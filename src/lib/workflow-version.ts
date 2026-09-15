@@ -4,18 +4,25 @@ import path from "node:path";
 import { getDb } from "@/lib/db";
 
 const WORKFLOW_VERSION_FILES = [
+  ["src", "lib", "workflow-version.ts"],
   ["scripts", "worker.ts"],
   ["src", "lib", "copilot.ts"],
+  ["src", "lib", "devloop-review.ts"],
+  ["src", "lib", "github.ts"],
+  ["src", "lib", "personal-skill-execution.ts"],
+  ["src", "lib", "personal-skill-trigger.ts"],
   ["src", "lib", "process.ts"],
   ["src", "lib", "repository-context.ts"],
+  ["src", "lib", "scoring.ts"],
   ["src", "lib", "workflow-cancellation.ts"],
+  ["src", "lib", "workflow-task-concurrency.ts"],
   ["src", "lib", "workflow.ts"],
 ];
 const WORKER_HEARTBEAT_MAX_AGE_MS = 15_000;
 
-function runtimeFingerprint() {
+export function workflowRuntimeFingerprint() {
   const hash = createHash("sha256");
-  hash.update("workflow-runtime-v5");
+  hash.update("workflow-runtime-v6");
   for (const segments of WORKFLOW_VERSION_FILES) {
     const absolutePath = path.join(process.cwd(), ...segments);
     hash.update(segments.join("/"));
@@ -28,7 +35,7 @@ function runtimeFingerprint() {
   return hash.digest("hex").slice(0, 16);
 }
 
-export const WORKFLOW_WORKER_VERSION = runtimeFingerprint();
+export const WORKFLOW_WORKER_VERSION = workflowRuntimeFingerprint();
 
 export function markWorkflowWorkerVersion() {
   const db = getDb();
@@ -63,7 +70,7 @@ export function hasCurrentWorkflowWorkerVersion() {
   const state = new Map(rows.map((row) => [row.key, row.value]));
   const heartbeat = Date.parse(state.get("workflow_worker_heartbeat") ?? "");
   return (
-    state.get("workflow_worker_version") === WORKFLOW_WORKER_VERSION &&
+    state.get("workflow_worker_version") === workflowRuntimeFingerprint() &&
     Number.isFinite(heartbeat) &&
     Date.now() - heartbeat <= WORKER_HEARTBEAT_MAX_AGE_MS
   );

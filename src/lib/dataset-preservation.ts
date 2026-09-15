@@ -1,7 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { loadGroundTruth } from "@/lib/ground-truth";
-import { pathMatchesFilters } from "@/lib/repository-source";
+import {
+  pathMatchesFilters,
+  prCreatedOnOrBefore,
+} from "@/lib/repository-source";
 
 export type ExistingDatasetPullRequest = {
   id: number;
@@ -9,11 +12,15 @@ export type ExistingDatasetPullRequest = {
   dataset_path: string;
   defect_description: string | null;
   url: string;
+  select_level?: number;
+  source_created_at?: string | null;
 };
 
 export async function findReusablePullRequests(
   pullRequests: ExistingDatasetPullRequest[],
   filters: string[],
+  expectedSelectLevel?: number,
+  createdBefore?: string | null,
 ) {
   const reusable: ExistingDatasetPullRequest[] = [];
   for (const pullRequest of pullRequests) {
@@ -27,7 +34,7 @@ export async function findReusablePullRequests(
         ),
       ]);
       const files = JSON.parse(filesJson) as Array<
-        string | { filename?: unknown }
+        string | { filename?: unknown; path?: unknown }
       >;
       const filenames = files
         .map((file) =>
@@ -35,7 +42,9 @@ export async function findReusablePullRequests(
             ? file
             : typeof file.filename === "string"
               ? file.filename
-              : null,
+              : typeof file.path === "string"
+                ? file.path
+                : null,
         )
         .filter((filename): filename is string => Boolean(filename));
       const matchesFilter =
@@ -44,7 +53,19 @@ export async function findReusablePullRequests(
       const creditedFindings = findings.filter(
         (finding) => (finding.scorePoint ?? 1) === 1,
       );
-      if (creditedFindings.length > 0 && matchesFilter) {
+      const matchesSelectLevel =
+        expectedSelectLevel === undefined ||
+        pullRequest.select_level === expectedSelectLevel;
+      const matchesCreationCutoff = prCreatedOnOrBefore(
+        pullRequest.source_created_at,
+        createdBefore,
+      );
+      if (
+        creditedFindings.length > 0 &&
+        matchesFilter &&
+        matchesSelectLevel &&
+        matchesCreationCutoff
+      ) {
         reusable.push(pullRequest);
       }
     } catch {

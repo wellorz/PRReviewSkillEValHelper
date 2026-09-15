@@ -125,7 +125,11 @@ export function matchFindings(
   const candidates: Match[] = [];
   humanFindings.forEach((human) => {
     modelFindings.forEach((model, modelFindingIndex) => {
+      if (model.rejectedHumanFindingIds?.includes(human.id)) return;
+      const adjudicated =
+        model.adjudicatedHumanFindingIds?.includes(human.id) ?? false;
       if (
+        !adjudicated &&
         human.iterationId != null &&
         model.iterationId !== human.iterationId
       ) {
@@ -139,19 +143,26 @@ export function matchFindings(
       const textScore = Math.max(lexicalScore, semanticTokens.score);
       const location = locationScore(human, model);
       const score =
-        location === 0 ? textScore : location * 0.55 + textScore * 0.45;
-      const legacyScore = location * 0.55 + lexicalScore * 0.45;
+        adjudicated
+          ? 2
+          : location === 0
+            ? textScore
+            : location * 0.55 + textScore * 0.45;
       const pathlessSemanticMatch =
         !human.path &&
         semanticTokens.intersection >= 4 &&
         semanticTokens.cosine >= 0.24 &&
         semanticTokens.overlap >= 0.32 &&
         semanticTokens.score >= 0.26;
+      const closeLocationMatch =
+        location >= 0.7 &&
+        semanticTokens.intersection >= 4 &&
+        textScore >= 0.3;
       if (
-        (location >= 0.7 && textScore >= 0.08) ||
+        adjudicated ||
+        closeLocationMatch ||
         (!human.path && lexicalScore >= 0.22) ||
-        pathlessSemanticMatch ||
-        legacyScore >= 0.38
+        pathlessSemanticMatch
       ) {
         candidates.push({
           humanFindingId: human.id,

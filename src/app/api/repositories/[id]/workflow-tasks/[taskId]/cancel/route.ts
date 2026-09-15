@@ -9,15 +9,17 @@ export async function POST(
   const db = getDb();
   const task = db
     .prepare(`
-      SELECT id, status
+      SELECT id, kind, status
       FROM workflow_tasks
       WHERE id = ? AND repository_id = ?
-        AND kind IN ('baseline', 'skill_eval')
+        AND kind IN ('manual_pr', 'baseline', 'skill_eval')
     `)
-    .get(taskId, id) as { id: number; status: string } | undefined;
+    .get(taskId, id) as
+    | { id: number; kind: string; status: string }
+    | undefined;
   if (!task) {
     return NextResponse.json(
-      { error: "Active PR review task not found" },
+      { error: "Active workflow task not found" },
       { status: 404 },
     );
   }
@@ -28,6 +30,7 @@ export async function POST(
     );
   }
   const status = task.status === "queued" ? "cancelled" : "cancelling";
+  const activity = task.kind === "manual_pr" ? "PR collection" : "PR review";
   db.prepare(`
     UPDATE workflow_tasks
     SET status = ?, status_message = ?,
@@ -35,7 +38,7 @@ export async function POST(
     WHERE id = ?
   `).run(
     status,
-    status === "cancelled" ? "Cancelled" : "Cancelling PR review",
+    status === "cancelled" ? "Cancelled" : `Cancelling ${activity}`,
     status,
     new Date().toISOString(),
     task.id,

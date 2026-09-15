@@ -37,7 +37,7 @@ test("preserves only credited snapshots matching the current path filter", async
     await Promise.all([
       fs.writeFile(
         path.join(matching, "files.json"),
-        JSON.stringify([{ filename: "src/service.ts" }]),
+        JSON.stringify([{ path: "/src/service.ts" }]),
       ),
       fs.writeFile(
         path.join(matching, "human-findings.json"),
@@ -93,6 +93,7 @@ test("preserves only credited snapshots matching the current path filter", async
         dataset_path: matching,
         defect_description: null,
         url: "https://example.test/pr/1",
+        select_level: 1,
       },
       {
         id: 2,
@@ -100,11 +101,20 @@ test("preserves only credited snapshots matching the current path filter", async
         dataset_path: outside,
         defect_description: null,
         url: "https://example.test/pr/2",
+        select_level: 0,
       },
     ];
     assert.deepEqual(
       (await findReusablePullRequests(rows, ["src"])).map((row) => row.id),
       [1],
+    );
+    assert.deepEqual(
+      (await findReusablePullRequests(rows, [], 1)).map((row) => row.id),
+      [1],
+    );
+    assert.deepEqual(
+      (await findReusablePullRequests(rows, [], 0)).map((row) => row.id),
+      [2],
     );
   } finally {
     await fs.rm(root, { recursive: true, force: true });

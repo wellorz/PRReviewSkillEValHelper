@@ -10,6 +10,7 @@ import {
 } from "react";
 import { modelLabel } from "@/lib/models";
 import { PageNavigation } from "@/app/page-navigation";
+import { DEFAULT_CONFIRMATION_WORDS } from "@/lib/collection-policy";
 
 type Repository = {
   id: number;
@@ -22,17 +23,28 @@ type Repository = {
   model_secondary: string;
   context_tier: string;
   target_prs: number;
+  pr_number_greater_than: number | null;
+  pr_number_less_than: number | null;
   status: string;
   status_message: string | null;
   scan_current: number;
   scan_total: number;
+  scan_current_prs: string | null;
   collected_count: number;
   pr_count: number;
   human_finding_count: number;
+  pr_set_oldest_pr: number | null;
+  pr_set_newest_pr: number | null;
+  pr_set_oldest_date: string | null;
+  pr_set_newest_date: string | null;
+  pr_created_before: string | null;
   updated_at: string;
   latest_scan_status: string | null;
   latest_scan_scanned_count: number | null;
   latest_scan_skipped_count: number | null;
+  latest_scan_eligible_count: number | null;
+  latest_scan_failed_count: number | null;
+  latest_scan_failed_prs_json: string | null;
   latest_scan_newest_pr: number | null;
   latest_scan_oldest_pr: number | null;
   latest_scan_newest_date: string | null;
@@ -74,19 +86,49 @@ type QuickReview = {
   result_path: string | null;
 };
 
+type ManualPrTask = {
+  id: number;
+  repository_id: number;
+  status: string;
+  current_item: number;
+  total_items: number;
+  status_message: string;
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
+};
+
 type Dashboard = {
   repositories: Repository[];
   runs: Run[];
   quickReviews: QuickReview[];
+  manualPrTasks: ManualPrTask[];
+};
+
+type ScreenshotScan = {
+  repositoryId: string;
+  fileNames: string[];
+  fileResults: Array<{
+    fileName: string;
+    prNumbers: number[];
+    confidence: number;
+    error: string | null;
+  }>;
+  prNumbers: number[];
+  existingPrNumbers: number[];
+  selectedPrNumbers: number[];
+  confidence: number;
 };
 
 const EMPTY_DASHBOARD: Dashboard = {
   repositories: [],
   runs: [],
   quickReviews: [],
+  manualPrTasks: [],
 };
 
 const BENCHMARK_FORM_STORAGE_KEY = "review-skill-lab:benchmark-form";
+const COMMENT_SELECTION_STORAGE_VERSION = 1;
 
 function formatDate(value: string | null) {
   if (!value) return "—";
@@ -94,6 +136,21 @@ function formatDate(value: string | null) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function parsePrNumberList(value: string | null) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (number): number is number =>
+            typeof number === "number" && Number.isInteger(number),
+        )
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 async function request(url: string, init?: RequestInit) {
@@ -105,6 +162,7 @@ async function request(url: string, init?: RequestInit) {
 
 export default function Home() {
   const importPrSetInput = useRef<HTMLInputElement>(null);
+  const screenshotInput = useRef<HTMLInputElement>(null);
   const [dashboard, setDashboard] = useState<Dashboard>(EMPTY_DASHBOARD);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
@@ -115,6 +173,23 @@ export default function Home() {
     scanLimit: 2000,
     usePathFilter: false,
     pathFilter: "",
+    collectionMode: "strict_confirmed" as
+      | "strict_confirmed"
+      | "resolved_comments",
+    confirmationWords: [] as string[],
+    prNumberGreaterThan: null as number | null,
+    prNumberLessThan: null as number | null,
+    prCreatedBefore: "",
+  });
+  const [confirmationInput, setConfirmationInput] = useState("");
+  const [screenshotScan, setScreenshotScan] = useState<ScreenshotScan>({
+    repositoryId: "",
+    fileNames: [],
+    fileResults: [],
+    prNumbers: [],
+    existingPrNumbers: [],
+    selectedPrNumbers: [],
+    confidence: 0,
   });
 
   const refresh = useCallback(async () => {
@@ -142,7 +217,9 @@ export default function Home() {
     const saved = window.localStorage.getItem(BENCHMARK_FORM_STORAGE_KEY);
     if (!saved) return;
     try {
-      const value = JSON.parse(saved) as Partial<typeof form>;
+      const value = JSON.parse(saved) as Partial<typeof form> & {
+        commentSelectionStorageVersion?: number;
+      };
       const timer = window.setTimeout(
         () =>
           setForm((current) => ({
@@ -164,6 +241,30 @@ export default function Home() {
               typeof value.pathFilter === "string"
                 ? value.pathFilter
                 : current.pathFilter,
+            collectionMode:
+              value.commentSelectionStorageVersion ===
+                COMMENT_SELECTION_STORAGE_VERSION &&
+              value.collectionMode === "resolved_comments"
+                ? "resolved_comments"
+                : "strict_confirmed",
+            confirmationWords: Array.isArray(value.confirmationWords)
+              ? value.confirmationWords.filter(
+                  (word): word is string =>
+                    typeof word === "string" && Boolean(word.trim()),
+                )
+              : [],
+            prNumberGreaterThan:
+              typeof value.prNumberGreaterThan === "number"
+                ? value.prNumberGreaterThan
+                : null,
+            prNumberLessThan:
+              typeof value.prNumberLessThan === "number"
+                ? value.prNumberLessThan
+                : null,
+            prCreatedBefore:
+              typeof value.prCreatedBefore === "string"
+                ? value.prCreatedBefore
+                : "",
           })),
         0,
       );
@@ -192,11 +293,18 @@ export default function Home() {
     0,
   );
   const navigationRepository = dashboard.repositories[0];
+  const latestManualPrTask = navigationRepository
+    ? (dashboard.manualPrTasks ?? []).find(
+        (task) =>
+          task.repository_id === navigationRepository.id &&
+          task.status !== "completed",
+      )
+    : undefined;
+  const repositoryCollectionActive = dashboard.repositories.some(
+    (repository) => ["queued", "syncing"].includes(repository.status),
+  );
   const collectionFilterLocked =
-    busy === "repository" ||
-    dashboard.repositories.some((repository) =>
-      ["queued", "syncing"].includes(repository.status),
-    );
+    busy === "repository" || repositoryCollectionActive;
 
   async function submitRepository(event: FormEvent) {
     event.preventDefault();
@@ -204,7 +312,10 @@ export default function Home() {
     setMessage(null);
     window.localStorage.setItem(
       BENCHMARK_FORM_STORAGE_KEY,
-      JSON.stringify(form),
+      JSON.stringify({
+        ...form,
+        commentSelectionStorageVersion: COMMENT_SELECTION_STORAGE_VERSION,
+      }),
     );
     try {
       await request("/api/repositories", {
@@ -213,6 +324,63 @@ export default function Home() {
         body: JSON.stringify(form),
       });
       setMessage("Repository queued. The worker will build its dataset.");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function addConfirmationWord() {
+    const word = confirmationInput.trim();
+    if (!word) return;
+    setForm((current) => {
+      const existing = [
+        ...DEFAULT_CONFIRMATION_WORDS,
+        ...current.confirmationWords,
+      ];
+      if (
+        existing.some(
+          (candidate) =>
+            candidate.toLocaleLowerCase() === word.toLocaleLowerCase(),
+        )
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        confirmationWords: [...current.confirmationWords, word],
+      };
+    });
+    setConfirmationInput("");
+  }
+
+  async function cancelRepositoryCollection(repositoryId: number) {
+    setBusy(`cancel-collection-${repositoryId}`);
+    setMessage(null);
+    try {
+      await request(`/api/repositories/${repositoryId}/cancel-collection`, {
+        method: "POST",
+      });
+      setMessage("PR collection cancellation requested.");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cancelManualPrCollection(task: ManualPrTask) {
+    setBusy(`cancel-manual-pr-${task.id}`);
+    setMessage(null);
+    try {
+      await request(
+        `/api/repositories/${task.repository_id}/workflow-tasks/${task.id}/cancel`,
+        { method: "POST" },
+      );
+      setMessage("Candidate PR collection cancellation requested.");
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
@@ -245,6 +413,117 @@ export default function Home() {
     } finally {
       setBusy(null);
       if (importPrSetInput.current) importPrSetInput.current.value = "";
+    }
+  }
+
+  async function scanPrScreenshots(files: File[]) {
+      if (!navigationRepository) {
+        setMessage("Configure a repository before scanning screenshots.");
+        return;
+      }
+      setBusy("scan-pr-screenshot");
+      setMessage(null);
+      try {
+        const formData = new FormData();
+        for (const file of files) formData.append("images", file);
+        const response = await fetch(
+          `/api/repositories/${navigationRepository.id}/screenshot-prs`,
+          {
+            method: "POST",
+            body: formData,
+          },
+        );
+        const body = (await response.json()) as {
+          error?: string;
+          prNumbers?: number[];
+          existingPrNumbers?: number[];
+          confidence?: number;
+          fileResults?: ScreenshotScan["fileResults"];
+        };
+        if (!response.ok) {
+          throw new Error(body.error ?? "Screenshot OCR failed");
+        }
+        const prNumbers = body.prNumbers ?? [];
+        const existingPrNumbers = body.existingPrNumbers ?? [];
+        const existing = new Set(existingPrNumbers);
+        const newPrNumbers = prNumbers.filter((number) => !existing.has(number));
+        setScreenshotScan((current) => ({
+          ...current,
+          repositoryId: String(navigationRepository.id),
+          fileNames: files.map((file) => file.name),
+          fileResults: body.fileResults ?? [],
+          prNumbers,
+          existingPrNumbers,
+          selectedPrNumbers:
+            newPrNumbers.length > 0 ? newPrNumbers : prNumbers,
+          confidence: body.confidence ?? 0,
+        }));
+        setMessage(
+          `Found ${prNumbers.length} explicit PR number${
+            prNumbers.length === 1 ? "" : "s"
+          } across ${files.length} screenshot${
+            files.length === 1 ? "" : "s"
+          }. Review the selection before collecting.`,
+        );
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(null);
+        if (screenshotInput.current) screenshotInput.current.value = "";
+      }
+    }
+
+  async function collectScreenshotPrs() {
+    if (
+      !screenshotScan.repositoryId ||
+      screenshotScan.selectedPrNumbers.length === 0
+    ) {
+      return;
+    }
+    setBusy("collect-screenshot-prs");
+    setMessage(null);
+    try {
+      const response = await fetch(
+        `/api/repositories/${screenshotScan.repositoryId}/manual-pr`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            values: screenshotScan.selectedPrNumbers.map(String),
+            requireValuedComments: true,
+          }),
+        },
+      );
+      const body = (await response.json()) as {
+        error?: string;
+        taskIds?: number[];
+        prNumbers?: number[];
+        concurrency?: number;
+      };
+      if (!response.ok) {
+        throw new Error(body.error ?? "Unable to queue screenshot PRs");
+      }
+      const count =
+        body.prNumbers?.length ?? screenshotScan.selectedPrNumbers.length;
+      setMessage(
+        `Queued ${count} PR candidate${
+          count === 1 ? "" : "s"
+        } with up to ${body.concurrency ?? 5} concurrent checks. Only eligible PRs with owner-confirmed valued findings will be added.`,
+      );
+      setScreenshotScan((current) => ({
+        ...current,
+        fileNames: [],
+        fileResults: [],
+        prNumbers: [],
+        existingPrNumbers: [],
+        selectedPrNumbers: [],
+        confidence: 0,
+      }));
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -339,7 +618,7 @@ export default function Home() {
             </label>
             <input
               placeholder="sources/dev/Management/src/ServiceHost/Servicelets"
-              disabled={!form.usePathFilter || collectionFilterLocked}
+              disabled={form.usePathFilter || collectionFilterLocked}
               value={form.pathFilter}
               onChange={(event) =>
                 setForm((current) => ({
@@ -353,6 +632,197 @@ export default function Home() {
               prefix. Separate folders with commas. This is independent from
               the Review Details filter.
             </small>
+          </div>
+
+          <fieldset className="collectionMethodField">
+            <legend>Comment selection method</legend>
+            <div className="collectionMethodOptions">
+              <label
+                className={`collectionMethodOption${form.collectionMode === "strict_confirmed" ? " selected" : ""}`}
+              >
+                <input
+                  type="radio"
+                  name="collectionMode"
+                  checked={form.collectionMode === "strict_confirmed"}
+                  disabled={collectionFilterLocked}
+                  onChange={() => {
+                    setForm((current) => ({
+                      ...current,
+                      collectionMode: "strict_confirmed",
+                    }));
+                  }}
+                />
+                <span>
+                  <strong>Strictly confirmed comments</strong>
+                  <small>
+                    Keep the current owner-confirmed collection behavior and
+                    assign SelectLevel 1.
+                  </small>
+                </span>
+              </label>
+              <label
+                className={`collectionMethodOption${form.collectionMode === "resolved_comments" ? " selected" : ""}`}
+              >
+                <input
+                  type="radio"
+                  name="collectionMode"
+                  checked={form.collectionMode === "resolved_comments"}
+                  disabled={collectionFilterLocked}
+                  onChange={() => {
+                    setForm((current) => ({
+                      ...current,
+                      collectionMode: "resolved_comments",
+                    }));
+                  }}
+                />
+                <span>
+                  <strong>All resolved comments</strong>
+                  <small>
+                    Collect substantive resolved Azure DevOps threads, excluding
+                    active, pending, and won&apos;t-fix dispositions.
+                  </small>
+                </span>
+              </label>
+            </div>
+
+            <div
+              className={`confirmationWords${form.collectionMode !== "strict_confirmed" ? " disabled" : ""}`}
+            >
+              <span className="fieldLabel">Confirmations</span>
+              <div className="confirmationWordList">
+                {DEFAULT_CONFIRMATION_WORDS.map((word) => (
+                  <span className="confirmationWord default" key={word}>
+                    {word}
+                  </span>
+                ))}
+                {form.confirmationWords.map((word) => (
+                  <span className="confirmationWord custom" key={word}>
+                    {word}
+                    <button
+                      type="button"
+                      aria-label={`Remove confirmation ${word}`}
+                      disabled={
+                        collectionFilterLocked ||
+                        form.collectionMode !== "strict_confirmed"
+                      }
+                      onClick={() =>
+                        setForm((current) => ({
+                          ...current,
+                          confirmationWords:
+                            current.confirmationWords.filter(
+                              (candidate) => candidate !== word,
+                            ),
+                        }))
+                      }
+                    >
+                      &times;
+                    </button>
+                  </span>
+                ))}
+              </div>
+              <div className="confirmationWordInput">
+                <input
+                  value={confirmationInput}
+                  placeholder="Add a confirmation word or phrase"
+                  disabled={
+                    collectionFilterLocked ||
+                    form.collectionMode !== "strict_confirmed"
+                  }
+                  onChange={(event) =>
+                    setConfirmationInput(event.target.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    addConfirmationWord();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="secondaryButton"
+                  disabled={
+                    collectionFilterLocked ||
+                    form.collectionMode !== "strict_confirmed" ||
+                    !confirmationInput.trim()
+                  }
+                  onClick={addConfirmationWord}
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          </fieldset>
+
+          <label>
+            PR created on or before
+            <input
+              type="date"
+              value={form.prCreatedBefore}
+              disabled={collectionFilterLocked}
+              onChange={(event) =>
+                setForm((current) => ({
+                  ...current,
+                  prCreatedBefore: event.target.value,
+                }))
+              }
+            />
+            <small>
+              Inclusive creation-date cutoff. Leave empty to scan all dates.
+            </small>
+          </label>
+
+          <div className="prNumberRangeField">
+            <div className="fieldLabel">
+              PR Num Range
+              <span
+                className="helpTooltip"
+                tabIndex={0}
+                aria-label="PR number range help"
+              >
+                *
+                <span role="tooltip">
+                  Optional exclusive bounds. Leave both empty for no PR-number
+                  filter. A left value keeps PR numbers greater than it; a
+                  right value keeps PR numbers smaller than it. Existing PRs
+                  already in the set are preserved.
+                </span>
+              </span>
+            </div>
+            <div className="prNumberRangeInputs">
+              <input
+                type="number"
+                min={1}
+                placeholder="Greater than"
+                aria-label="PR number greater than"
+                value={form.prNumberGreaterThan ?? ""}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    prNumberGreaterThan:
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value),
+                  }))
+                }
+              />
+              <span>–</span>
+              <input
+                type="number"
+                min={1}
+                placeholder="Less than"
+                aria-label="PR number less than"
+                value={form.prNumberLessThan ?? ""}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    prNumberLessThan:
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value),
+                  }))
+                }
+              />
+            </div>
           </div>
 
           <div className="fieldRow">
@@ -392,12 +862,208 @@ export default function Home() {
             </label>
           </div>
 
-          <button className="primaryButton" disabled={busy === "repository"}>
-            {busy === "repository" ? "Collecting…" : "Collect PR"}
+          <button className="primaryButton" disabled={collectionFilterLocked}>
+            {busy === "repository"
+              ? "Queuing…"
+              : repositoryCollectionActive
+                ? "Collecting…"
+                : "Collect PR"}
           </button>
           <p className="prerequisite">
             Requires authenticated <code>gh</code> and <code>copilot</code> CLIs.
           </p>
+
+          <div className="screenshotImportSection">
+            <div className="screenshotImportTitle">
+              <strong>Collect PRs from screenshot</strong>
+              <span className="badge">Local OCR</span>
+            </div>
+            <p className="screenshotImportDescription">
+              Upload up to 10 screenshots containing entries such as{" "}
+              <code>Merged PR 5606853</code>. PRs are collected into{" "}
+              <strong>
+                {navigationRepository
+                  ? navigationRepository.display_name ||
+                    navigationRepository.slug
+                  : "the configured repository"}
+              </strong>
+              . Commit and task IDs are ignored.
+            </p>
+            <button
+              type="button"
+              className="secondaryButton screenshotUploadButton"
+              disabled={
+                !navigationRepository || busy === "scan-pr-screenshot"
+              }
+              onClick={() => screenshotInput.current?.click()}
+            >
+              {busy === "scan-pr-screenshot"
+                ? "Reading screenshots…"
+                : "Upload screenshots"}
+            </button>
+            <input
+              ref={screenshotInput}
+              className="visuallyHidden"
+              type="file"
+              multiple
+              accept="image/png,image/jpeg,image/webp"
+              onChange={(event) => {
+                const files = Array.from(event.target.files ?? []);
+                if (files.length > 0) void scanPrScreenshots(files);
+              }}
+            />
+
+            {latestManualPrTask && (
+              <div
+                className={`screenshotTaskProgress status-${latestManualPrTask.status}`}
+              >
+                <div className="progressLabel">
+                  <strong>{latestManualPrTask.status_message}</strong>
+                  <span>
+                    {latestManualPrTask.current_item}/
+                    {latestManualPrTask.total_items || "?"}
+                  </span>
+                </div>
+                {["queued", "running", "cancelling"].includes(
+                  latestManualPrTask.status,
+                ) && (
+                  <div className="progressTrack">
+                    <span
+                      style={{
+                        width: latestManualPrTask.total_items
+                          ? `${Math.min(
+                              100,
+                              (latestManualPrTask.current_item /
+                                latestManualPrTask.total_items) *
+                                100,
+                            )}%`
+                          : "3%",
+                      }}
+                    />
+                  </div>
+                )}
+                {["queued", "running", "cancelling"].includes(
+                  latestManualPrTask.status,
+                ) && (
+                  <button
+                    type="button"
+                    className="dangerButton collectionCancelButton"
+                    disabled={
+                      latestManualPrTask.status === "cancelling" ||
+                      busy === `cancel-manual-pr-${latestManualPrTask.id}`
+                    }
+                    onClick={() =>
+                      void cancelManualPrCollection(latestManualPrTask)
+                    }
+                  >
+                    {latestManualPrTask.status === "cancelling" ||
+                    busy === `cancel-manual-pr-${latestManualPrTask.id}`
+                      ? "Cancelling…"
+                      : "Cancel collection"}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {screenshotScan.prNumbers.length > 0 && (
+              <div className="screenshotPreview">
+                <div className="screenshotPreviewHeading">
+                  <div>
+                    <strong>
+                      {screenshotScan.fileNames.length} screenshot
+                      {screenshotScan.fileNames.length === 1 ? "" : "s"} scanned
+                    </strong>
+                    <span>
+                      {screenshotScan.prNumbers.length} PR candidates detected · OCR
+                      confidence {screenshotScan.confidence.toFixed(0)}%
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondaryButton compact"
+                    onClick={() =>
+                      setScreenshotScan((current) => ({
+                        ...current,
+                        selectedPrNumbers:
+                          current.selectedPrNumbers.length ===
+                          current.prNumbers.length
+                            ? []
+                            : current.prNumbers,
+                      }))
+                    }
+                  >
+                    {screenshotScan.selectedPrNumbers.length ===
+                    screenshotScan.prNumbers.length
+                      ? "Clear all"
+                      : "Select all"}
+                  </button>
+                </div>
+                <div className="screenshotFileResults">
+                  {screenshotScan.fileResults.map((result) => (
+                    <div
+                      className={result.error ? "hasError" : ""}
+                      key={result.fileName}
+                    >
+                      <span>{result.fileName}</span>
+                      <em>
+                        {result.error ??
+                          `${result.prNumbers.length} PR${
+                            result.prNumbers.length === 1 ? "" : "s"
+                          } · ${result.confidence.toFixed(0)}%`}
+                      </em>
+                    </div>
+                  ))}
+                </div>
+                <div className="screenshotPrGrid">
+                  {screenshotScan.prNumbers.map((number) => {
+                    const checked =
+                      screenshotScan.selectedPrNumbers.includes(number);
+                    const existing =
+                      screenshotScan.existingPrNumbers.includes(number);
+                    return (
+                      <label className="screenshotPrOption" key={number}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) =>
+                            setScreenshotScan((current) => ({
+                              ...current,
+                              selectedPrNumbers: event.target.checked
+                                ? [...current.selectedPrNumbers, number]
+                                : current.selectedPrNumbers.filter(
+                                    (value) => value !== number,
+                                  ),
+                            }))
+                          }
+                        />
+                        <span>#{number}</span>
+                        {existing && <em>already collected</em>}
+                      </label>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  className="primaryButton"
+                  disabled={
+                    screenshotScan.selectedPrNumbers.length === 0 ||
+                    busy === "collect-screenshot-prs"
+                  }
+                  onClick={() => void collectScreenshotPrs()}
+                >
+                  {busy === "collect-screenshot-prs"
+                    ? "Queuing…"
+                    : `Check ${
+                        screenshotScan.selectedPrNumbers.length
+                      } selected PR candidate${
+                        screenshotScan.selectedPrNumbers.length === 1
+                          ? ""
+                          : "s"
+                      }`}
+                </button>
+              </div>
+            )}
+          </div>
         </form>
 
         <section className="panel repositoriesPanel">
@@ -501,39 +1167,121 @@ export default function Home() {
                       Changes under <code>{repository.path_filter}</code>
                     </p>
                   )}
+                  {(repository.pr_number_greater_than != null ||
+                    repository.pr_number_less_than != null) && (
+                    <p className="pathFilter">
+                      PR numbers{" "}
+                      <code>
+                        {repository.pr_number_greater_than != null
+                          ? `> ${repository.pr_number_greater_than}`
+                          : "without lower bound"}
+                        {" · "}
+                        {repository.pr_number_less_than != null
+                          ? `< ${repository.pr_number_less_than}`
+                          : "without upper bound"}
+                      </code>
+                    </p>
+                  )}
                   <div className="miniStats">
                     <span><strong>{repository.pr_count}</strong> PRs</span>
                     <span><strong>{repository.human_finding_count}</strong> human findings</span>
                     <span><strong>{repository.target_prs}</strong> target</span>
                   </div>
-                  {repository.latest_scan_started_at && (
+                  {repository.pr_set_oldest_pr &&
+                    repository.pr_set_newest_pr && (
                     <div className="scanCheckpoint">
-                      <strong>
-                        {repository.latest_scan_status === "running"
-                          ? "Current scan checkpoint"
-                          : "Latest scan checkpoint"}
-                      </strong>
+                      <strong>Current PR set checkpoint</strong>
                       <span>
-                        {repository.latest_scan_oldest_pr &&
-                        repository.latest_scan_newest_pr
-                          ? `PR #${repository.latest_scan_oldest_pr}–#${repository.latest_scan_newest_pr}`
-                          : "No PR range recorded yet"}
+                        PR #{repository.pr_set_oldest_pr}–#
+                        {repository.pr_set_newest_pr}
                       </span>
                       <span>
-                        {repository.latest_scan_oldest_date &&
-                        repository.latest_scan_newest_date
-                          ? `${formatDate(repository.latest_scan_oldest_date)} – ${formatDate(repository.latest_scan_newest_date)}`
+                        {repository.pr_set_oldest_date &&
+                        repository.pr_set_newest_date
+                          ? `${formatDate(repository.pr_set_oldest_date)} – ${formatDate(repository.pr_set_newest_date)}`
                           : "No source-date range recorded yet"}
                       </span>
-                      <span>
-                        {repository.latest_scan_scanned_count ?? 0} inspected ·{" "}
-                        {repository.latest_scan_skipped_count ?? 0} reused from
-                        cache · {repository.latest_scan_policy_version}
-                      </span>
+                      {repository.latest_scan_started_at && (
+                        <>
+                          <span>
+                            Last full scan:{" "}
+                            {repository.latest_scan_scanned_count ?? 0} inspected ·{" "}
+                            {repository.latest_scan_skipped_count ?? 0} reused
+                            from cache ·{" "}
+                            {repository.latest_scan_eligible_count ?? 0} collected
+                            {" · "}
+                            {repository.latest_scan_policy_version}
+                          </span>
+                          {(repository.latest_scan_failed_count ?? 0) > 0 && (
+                            <span className="scanFailureSummary">
+                              Git failures after three retries:{" "}
+                              {parsePrNumberList(
+                                repository.latest_scan_failed_prs_json,
+                              )
+                                .map((number) => `#${number}`)
+                                .join(", ")}
+                            </span>
+                          )}
+                          {repository.latest_scan_oldest_pr != null &&
+                            repository.latest_scan_newest_pr != null && (
+                              <span>
+                                Scan coverage: PR #
+                                {repository.latest_scan_oldest_pr}–#
+                                {repository.latest_scan_newest_pr}
+                              </span>
+                            )}
+                          {repository.latest_scan_oldest_date &&
+                            repository.latest_scan_newest_date && (
+                              <span>
+                                Scan source dates:{" "}
+                                {formatDate(repository.latest_scan_oldest_date)} –{" "}
+                                {formatDate(repository.latest_scan_newest_date)}
+                              </span>
+                            )}
+                          {repository.latest_scan_oldest_pr != null &&
+                            repository.latest_scan_newest_pr != null && (
+                              <div className="scanRangeActions">
+                                <span>Continue with a non-overlapping range:</span>
+                                <button
+                                  type="button"
+                                  className="secondaryButton compact"
+                                  onClick={() =>
+                                    setForm((current) => ({
+                                      ...current,
+                                      prNumberGreaterThan: null,
+                                      prNumberLessThan:
+                                        repository.latest_scan_oldest_pr,
+                                    }))
+                                  }
+                                >
+                                  Next older: &lt; #
+                                  {repository.latest_scan_oldest_pr}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="secondaryButton compact"
+                                  onClick={() =>
+                                    setForm((current) => ({
+                                      ...current,
+                                      prNumberGreaterThan:
+                                        repository.latest_scan_newest_pr,
+                                      prNumberLessThan: null,
+                                    }))
+                                  }
+                                >
+                                  Next newer: &gt; #
+                                  {repository.latest_scan_newest_pr}
+                                </button>
+                              </div>
+                            )}
+                        </>
+                      )}
                     </div>
                   )}
                   {(repository.status === "syncing" ||
                     repository.status === "queued" ||
+                    repository.status === "cancelling" ||
+                    repository.status === "cancelled" ||
                     repository.status === "failed") && (
                     <div className="datasetProgress">
                       <div className="progressLabel">
@@ -542,16 +1290,32 @@ export default function Home() {
                             <span>Collection queued</span>
                             <span>Not started</span>
                           </>
+                        ) : repository.status === "cancelled" ? (
+                          <>
+                            <span>Collection cancelled</span>
+                            <span>
+                              {repository.scan_current}/
+                              {repository.scan_total || "?"} scanned
+                            </span>
+                          </>
                         ) : (
                           <>
                             <span>
                               {repository.scan_current}/
                               {repository.scan_total || "?"} scanned
                             </span>
-                            <span>{repository.collected_count} collected</span>
                           </>
                         )}
                       </div>
+                      {repository.scan_current_prs && (
+                        <div className="scanCurrentPrs">
+                          {repository.status === "syncing" ||
+                          repository.status === "cancelling"
+                            ? "Currently scanning"
+                            : "Last scanned"}
+                          : {repository.scan_current_prs}
+                        </div>
+                      )}
                       <div className="progressTrack">
                         <span
                           style={{
@@ -566,6 +1330,26 @@ export default function Home() {
                           }}
                         />
                       </div>
+                      {["queued", "syncing", "cancelling"].includes(
+                        repository.status,
+                      ) && (
+                        <button
+                          type="button"
+                          className="dangerButton collectionCancelButton"
+                          disabled={
+                            repository.status === "cancelling" ||
+                            busy === `cancel-collection-${repository.id}`
+                          }
+                          onClick={() =>
+                            void cancelRepositoryCollection(repository.id)
+                          }
+                        >
+                          {repository.status === "cancelling" ||
+                          busy === `cancel-collection-${repository.id}`
+                            ? "Cancelling…"
+                            : "Cancel collection"}
+                        </button>
+                      )}
                     </div>
                   )}
                 </article>

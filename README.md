@@ -16,6 +16,7 @@ The application:
 - records precision, recall, F1, false positives, match quality, elapsed time,
   and Copilot usage;
 - writes a report for every PR quiz and an aggregate run report;
+- extracts explicit PR numbers from uploaded screenshots using local OCR;
 - provides a single dashboard for configuration, collection, runs, schedules,
   progress, and reports.
 
@@ -40,7 +41,10 @@ npm run dev:all
 
 Open the URL printed by Next.js. `dev:all` starts both the web UI and the durable
 worker. The worker must remain active for dataset scans, scheduled runs, and
-Copilot evaluations.
+Copilot evaluations. In local development, `dev:all` gracefully restarts the
+worker when workflow TypeScript changes so it stays synchronized with the
+hot-reloaded UI and API routes. An active task is allowed to finish before the
+new worker starts, preventing overlapping worker processes.
 
 On Windows, after installing dependencies, use `.\scripts\start-local.ps1` to
 start both processes and open the browser automatically when the web app is
@@ -54,7 +58,31 @@ concurrency. A baseline result unit is one baseline profile × one PR. A skill
 result unit is one named personal skill × one PR.
 
 1. Enter GitHub `owner/repository` or an Azure DevOps repository URL.
+   Choose exactly one comment-selection method:
+   - **Strictly confirmed comments** preserves the existing collection policy:
+     an eligible review comment must be followed by an explicit PR-owner
+     confirmation. These automatically collected PRs are stored with
+     `SelectLevel = 1`.
+   - **All resolved comments** collects substantive Azure DevOps review threads
+     whose disposition is fixed, closed, or resolved. Active, pending,
+     won't-fix, by-design, minor, style, naming, typo, and test-only comments
+     are excluded.
+   The dashboard lists the built-in confirmation phrases and accepts additional
+   case-insensitive phrases. Changing the method or custom phrases invalidates
+   the eligibility scan cache.
+   Collection runs are additive: eligible PRs retained from earlier number
+   ranges or selection methods remain in the dataset until explicitly removed.
+   An optional inclusive creation-date cutoff can exclude newer PRs from a
+   collection run.
+   PR-scoped Git operations use one initial attempt plus up to three retries.
+   If all four attempts fail, the collector skips only that PR, continues the
+   scan, and records the failed PR number in the final dashboard and dataset
+   manifest summary.
 2. Collect the dataset and open the repository's **PR workspace**.
+   The dashboard can also scan a PNG, JPEG, or WebP screenshot locally,
+   preview explicit `PR <number>` candidates, and check selected PRs for
+   owner-confirmed valued findings before adding eligible entries to the
+   current repository.
 3. Add any number of repository-scoped baseline profiles. A profile is uniquely
    identified by Model 1, optional Model 2, and context tier, with an optional
    display name. When Model 2 is enabled, both raw reviews run concurrently and
@@ -75,6 +103,24 @@ result unit is one named personal skill × one PR.
 8. Select PRs and personal skills, then click **Eval Skill**. Only the selected
    skill × PR units run or re-run. Skill results use the current Model 1,
    optional Model 2, and context configuration.
+9. Optionally enable **Build Knowledge Graph** before analyzing missed findings.
+   Unsupported or ambiguous comments are then rechecked against an immutable
+   worktree at the exact reviewed commit. The worker refreshes escaped HTML
+   knowledge graphs under
+   `Reviewers\CodeReading\<project>\<symbol>\knowledge-graph.html`, restages the
+   skill, and performs one final adjudication pass. Supported findings and
+   analyses with the option disabled keep the existing single-pass behavior.
+   Generated CodeReading files are evidence and are never automated mitigation
+   targets.
+10. **Train Personal Skill** requires exactly one selected personal skill. After
+    confirmation, the durable local-only workflow reviews all selected PRs,
+    analyzes and applies safe mitigations only for PRs earning zero credit, and
+    retries that reduced set. It stops as soon as every retried PR earns credit
+    or after five mitigation-and-retry iterations. While active, **Cancel
+    Training** stops future iterations and aborts the running review or analysis
+    process tree; completed reviews and mitigations already applied remain
+    intact. Per-PR Analyze remains available for investigation, while bulk
+    analyze-and-apply is handled only by training.
 
 Skill evaluation requires a completed baseline profile matching **Model 1 +
 Model 2 + the current orchestration context** for every selected PR. This keeps
@@ -310,6 +356,7 @@ weakening the blind-evaluation controls.
 npm run dev        # UI only
 npm run worker     # durable job and schedule worker
 npm run dev:all    # UI and worker
+npm run worker:dev # worker with automatic workflow-code restart
 npm test
 npm run lint
 npm run build

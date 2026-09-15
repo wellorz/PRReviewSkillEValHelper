@@ -1,12 +1,19 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  runCopilotCodeReading,
   runCopilotSkillAnalysis,
   validateSkillPath,
 } from "@/lib/copilot";
+import { writeCodeReadingKnowledge } from "@/lib/code-reading-knowledge";
 import { getDb } from "@/lib/db";
-import { loadGroundTruth } from "@/lib/ground-truth";
+import {
+  loadReviewSnapshots,
+  type ReviewSnapshot,
+} from "@/lib/ground-truth";
 import { DATA_DIR } from "@/lib/paths";
+import { createHistoricalRepositoryContext } from "@/lib/repository-context";
+import { throwIfWorkflowCancelled } from "@/lib/workflow-cancellation";
 import { matchFindings } from "@/lib/scoring";
 import type {
   HumanFinding,
@@ -17,7 +24,7 @@ import type {
   SkillMitigationEdit,
 } from "@/lib/types";
 
-type SkillAnalysisJob = {
+export type SkillAnalysisJob = {
   id: number;
   repository_id: number;
   skill_id: number;
@@ -60,6 +67,19 @@ function scoredFindings(truth: HumanFinding[]) {
   return truth.filter((finding) => (finding.scorePoint ?? 1) === 1);
 }
 
+export function selectMissedReviewSnapshots(
+  snapshots: ReviewSnapshot[],
+  missedFindings: HumanFinding[],
+) {
+  const missedIds = new Set(missedFindings.map((finding) => finding.id));
+  return snapshots
+    .map((snapshot) => ({
+      ...snapshot,
+      truth: snapshot.truth.filter((finding) => missedIds.has(finding.id)),
+    }))
+    .filter((snapshot) => snapshot.truth.length > 0);
+}
+
 async function stageSkill(skillPath: string, workspace: string) {
   const validated = await validateSkillPath(skillPath);
   const destination = path.join(workspace, "skill");
@@ -93,36 +113,85 @@ async function listSkillImplementationFiles(
   return files.sort();
 }
 
-function keepImplementationGroundedEdits(
+async function configuredSkillImplementationRoot(skillPath: string) {
+  const validated = await validateSkillPath(skillPath);
+  if (validated.kind === "skill") return validated.resolved;
+  const skillsRoot = path.join(validated.resolved, ".github", "skills");
+  const entries = (await fs.readdir(skillsRoot, { withFileTypes: true })).filter(
+    (entry) => entry.isDirectory(),
+  );
+  if (entries.length !== 1) {
+    throw new Error(
+      "Knowledge graph generation requires a directly configured skill or a repository containing exactly one skill",
+    );
+  }
+  return path.join(skillsRoot, entries[0].name);
+}
+
+export function shouldBuildKnowledgeGraph(
+  enabled: boolean,
+  status: SkillAnalysisOutput["commentAssessmentStatus"],
+) {
+  return enabled && status !== "supported";
+}
+
+export function keepImplementationGroundedEdits(
   output: SkillAnalysisOutput,
   skillFiles: string[],
 ): SkillAnalysisOutput {
-  const available = new Set(skillFiles.map((file) => file.toLowerCase()));
-  const edits = output.edits.filter((edit) => {
-    const target = edit.file.toLowerCase();
-    const route = edit.implementationPath.map((file) => file.toLowerCase());
+  const normalizedFiles = skillFiles.map((file) =>
+    file.replaceAll("\\", "/"),
+  );
+  function resolveFile(file: string) {
+    const normalized = file.replaceAll("\\", "/");
+    const exact = normalizedFiles.find(
+      (candidate) => candidate.toLowerCase() === normalized.toLowerCase(),
+    );
+    if (exact) return exact;
+    const suffix = `/${normalized}`.toLowerCase();
+    const stagedMatches = normalizedFiles.filter(
+      (candidate) =>
+        candidate.toLowerCase().startsWith(".github/skills/") &&
+        candidate.toLowerCase().endsWith(suffix),
+    );
+    return stagedMatches.length === 1 ? stagedMatches[0] : null;
+  }
+  const edits = output.edits.flatMap((edit) => {
+    const target = resolveFile(edit.file);
+    const route = edit.implementationPath.map(resolveFile);
     if (
-      !available.has(target) ||
-      route.at(-1) !== target ||
-      route.some((file) => !available.has(file))
+      !target ||
+      route.at(-1)?.toLowerCase() !== target.toLowerCase() ||
+      route.some((file) => !file)
     ) {
-      return false;
+      return [];
     }
-    const isSkillEntryPoint = /(^|\/)skill\.md$/i.test(edit.file);
-    return !isSkillEntryPoint || edit.targetKind === "orchestration";
+    const isSkillEntryPoint = /(^|\/)skill\.md$/i.test(target);
+    if (isSkillEntryPoint && edit.targetKind !== "orchestration") return [];
+    if (/(^|\/)reviewers\/codereading\//i.test(target)) return [];
+    return [
+      {
+        ...edit,
+        file: target,
+        implementationPath: route.filter(
+          (file): file is string => Boolean(file),
+        ),
+      },
+    ];
   });
   return { ...output, edits };
 }
 
 async function analyzePullRequest(
   job: SkillAnalysisJob,
+  repository: RepositoryRecord,
   skill: PersonalReviewSkillRecord,
   pr: AnalysisPr,
 ) {
   const db = getDb();
   const skillResult = db
     .prepare(`
-      SELECT findings_json
+      SELECT findings_json, skill_snapshot_path
       FROM personal_skill_results
       WHERE skill_id = ? AND pull_request_id = ?
         AND model = ? AND model_secondary = ? AND context_tier = ?
@@ -134,16 +203,26 @@ async function analyzePullRequest(
       job.model,
       job.model_secondary,
       job.context_tier,
-    ) as { findings_json: string | null } | undefined;
+    ) as {
+      findings_json: string | null;
+      skill_snapshot_path: string | null;
+    } | undefined;
   if (!skillResult) {
     throw new Error("A completed skill review is required before analysis");
   }
-  const truth = scoredFindings(await loadGroundTruth(pr));
+  const snapshots = await loadReviewSnapshots(pr);
+  const truth = scoredFindings(
+    snapshots.flatMap((snapshot) => snapshot.truth),
+  );
   const skillFindings = findings(skillResult.findings_json);
   const matchedIds = new Set(
     matchFindings(truth, skillFindings).map((match) => match.humanFindingId),
   );
   const missedFindings = truth.filter((finding) => !matchedIds.has(finding.id));
+  const missedSnapshots = selectMissedReviewSnapshots(
+    snapshots,
+    missedFindings,
+  );
   const analysisResult = db
     .prepare(`
       SELECT id FROM skill_analysis_results
@@ -160,6 +239,14 @@ async function analyzePullRequest(
   if (missedFindings.length === 0) {
     const output: SkillAnalysisOutput = {
       summary: "The skill received full credit for this PR.",
+      commentAssessmentStatus: "supported",
+      changeAndCommentAssessment:
+        "All scored human findings are already matched by the review.",
+      assessmentEvidence: [],
+      escalation: "",
+      reviewAspect: "No unmatched review aspect remains.",
+      prevention: "No additional preventive behavior is required.",
+      skillGap: "No demonstrated skill gap remains for this PR.",
       whyMissed: "No scored human findings were missed.",
       mitigation: "No mitigation is required.",
       edits: [],
@@ -176,12 +263,45 @@ async function analyzePullRequest(
   const workspace = analysisRoot(job.id, pr.number);
   await fs.rm(workspace, { recursive: true, force: true });
   await fs.mkdir(workspace, { recursive: true });
+  if (missedSnapshots.length === 0) {
+    throw new Error("Missed findings are not associated with a review snapshot");
+  }
+  const primarySnapshot = missedSnapshots[0];
   await Promise.all(
     ["pr.json", "files.json", "diff.patch"].map((file) =>
-      fs.copyFile(path.join(pr.dataset_path, file), path.join(workspace, file)),
+      fs.copyFile(
+        path.join(primarySnapshot.datasetPath, file),
+        path.join(workspace, file),
+      ),
     ),
   );
-  await stageSkill(skill.path, workspace);
+  const snapshotManifest = await Promise.all(
+    missedSnapshots.map(async (snapshot, index) => {
+      const relativePath = path.join(
+        "review-snapshots",
+        `snapshot-${index + 1}`,
+      );
+      const destination = path.join(workspace, relativePath);
+      await fs.mkdir(destination, { recursive: true });
+      await Promise.all(
+        ["pr.json", "files.json", "diff.patch"].map((file) =>
+          fs.copyFile(
+            path.join(snapshot.datasetPath, file),
+            path.join(destination, file),
+          ),
+        ),
+      );
+      return {
+        key: snapshot.key,
+        iterationId: snapshot.iterationId,
+        sourceCommit: snapshot.sourceCommit,
+        targetCommit: snapshot.targetCommit,
+        relativePath: relativePath.replaceAll("\\", "/"),
+        findingIds: snapshot.truth.map((finding) => finding.id),
+      };
+    }),
+  );
+  await stageSkill(skillResult.skill_snapshot_path ?? skill.path, workspace);
   const skillFiles = await listSkillImplementationFiles(
     path.join(workspace, "skill"),
   );
@@ -191,9 +311,21 @@ async function analyzePullRequest(
       JSON.stringify(
         {
           configuredPath: skill.path,
+          reviewedSnapshotPath: skillResult.skill_snapshot_path,
           files: skillFiles,
           instruction:
             "Trace the actual review execution path before proposing edits.",
+        },
+        null,
+        2,
+      ),
+    ),
+    fs.writeFile(
+      path.join(workspace, "analysis-snapshots.json"),
+      JSON.stringify(
+        {
+          primary: snapshotManifest[0].relativePath,
+          snapshots: snapshotManifest,
         },
         null,
         2,
@@ -208,15 +340,153 @@ async function analyzePullRequest(
       JSON.stringify({ findings: skillFindings }, null, 2),
     ),
   ]);
-  const run = await runCopilotSkillAnalysis({
+  const initialRun = await runCopilotSkillAnalysis({
     workspace,
     model: job.model,
     contextTier: job.context_tier,
     usagePath: path.join(workspace, "analysis-usage.json"),
   });
+  let output = initialRun.output;
+  let runDurationMs = initialRun.durationMs;
+  let runUsage: unknown = initialRun.usage;
+  let rawOutput = initialRun.rawOutput;
+  let currentSkillFiles = skillFiles;
+  if (
+    shouldBuildKnowledgeGraph(
+      Boolean(repository.build_knowledge_graph),
+      output.commentAssessmentStatus,
+    )
+  ) {
+    if (!repository.local_repo_path) {
+      throw new Error(
+        "Set a verified Local repository path before building a knowledge graph",
+      );
+    }
+    await fs.writeFile(
+      path.join(workspace, "initial-analysis.json"),
+      JSON.stringify(output, null, 2),
+    );
+    const repositoryContext = await createHistoricalRepositoryContext({
+      repository,
+      datasetPath: primarySnapshot.datasetPath,
+      worktreePath: path.join(workspace, "repository-worktree"),
+      shareReadOnly: true,
+    });
+    try {
+      await fs.writeFile(
+        path.join(workspace, "repository-context.json"),
+        JSON.stringify(
+          {
+            path: repositoryContext.path,
+            commit: repositoryContext.commit,
+            configuredPath: repository.local_repo_path,
+            instruction:
+              "Use only this read-only historical checkout for product source.",
+          },
+          null,
+          2,
+        ),
+      );
+      const knowledgeRun = await runCopilotCodeReading({
+        workspace,
+        model: job.model,
+        contextTier: job.context_tier,
+        usagePath: path.join(workspace, "code-reading-usage.json"),
+        repositoryRoot: repositoryContext.path,
+        skillRoot: path.join(workspace, "skill"),
+      });
+      await fs.writeFile(
+        path.join(workspace, "code-reading-knowledge.json"),
+        JSON.stringify(knowledgeRun.output, null, 2),
+      );
+      const configuredSkillRoot = await configuredSkillImplementationRoot(
+        skill.path,
+      );
+      const generatedAt = new Date().toISOString();
+      const knowledgeGraphFiles = await writeCodeReadingKnowledge({
+        skillRoot: configuredSkillRoot,
+        backupRoot: path.join(
+          DATA_DIR,
+          "skill-analysis",
+          "backups",
+          `job-${job.id}`,
+          `pr-${pr.number}`,
+          "code-reading",
+        ),
+        projectName:
+          repository.repository_name ||
+          path.basename(repository.local_repo_path),
+        repositoryCommit: repositoryContext.commit,
+        generatedAt,
+        output: knowledgeRun.output,
+      });
+      await fs.writeFile(
+        path.join(workspace, "generated-knowledge-files.json"),
+        JSON.stringify(
+          {
+            generatedAt,
+            repositoryCommit: repositoryContext.commit,
+            files: knowledgeGraphFiles,
+          },
+          null,
+          2,
+        ),
+      );
+      await stageSkill(skill.path, workspace);
+      currentSkillFiles = await listSkillImplementationFiles(
+        path.join(workspace, "skill"),
+      );
+      await fs.writeFile(
+        path.join(workspace, "skill-implementation.json"),
+        JSON.stringify(
+          {
+            configuredPath: skill.path,
+            reviewedSnapshotPath: skillResult.skill_snapshot_path,
+            files: currentSkillFiles,
+            instruction:
+              "Trace the actual review execution path before proposing edits. Generated CodeReading files are evidence, not mitigation targets.",
+          },
+          null,
+          2,
+        ),
+      );
+      const recheckRun = await runCopilotSkillAnalysis({
+        workspace,
+        model: job.model,
+        contextTier: job.context_tier,
+        usagePath: path.join(workspace, "analysis-recheck-usage.json"),
+        repositoryRoot: repositoryContext.path,
+        recheckWithKnowledge: true,
+      });
+      output = {
+        ...recheckRun.output,
+        initialCommentAssessmentStatus: initialRun.output.commentAssessmentStatus,
+        knowledgeRecheckPerformed: true,
+        knowledgeGraphSummary: knowledgeRun.output.summary,
+        knowledgeGraphFiles,
+      };
+      runDurationMs =
+        initialRun.durationMs + knowledgeRun.durationMs + recheckRun.durationMs;
+      runUsage = {
+        initialAnalysis: initialRun.usage,
+        codeReading: knowledgeRun.usage,
+        recheck: recheckRun.usage,
+      };
+      rawOutput = [
+        "=== INITIAL ANALYSIS ===",
+        initialRun.rawOutput,
+        "=== CODE READING ===",
+        knowledgeRun.rawOutput,
+        "=== RECHECK ===",
+        recheckRun.rawOutput,
+      ].join("\n\n");
+    } finally {
+      await repositoryContext.cleanup();
+    }
+  }
   const groundedOutput = keepImplementationGroundedEdits(
-    run.output,
-    skillFiles,
+    output,
+    currentSkillFiles,
   );
   db.prepare(`
     UPDATE skill_analysis_results SET
@@ -226,11 +496,11 @@ async function analyzePullRequest(
       updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `).run(
-    run.durationMs,
+    runDurationMs,
     JSON.stringify(groundedOutput),
     JSON.stringify(groundedOutput.edits),
-    JSON.stringify(run.usage),
-    run.rawOutput,
+    JSON.stringify(runUsage),
+    rawOutput,
     analysisResult.id,
   );
   return {
@@ -255,6 +525,26 @@ function safeTarget(root: string, relativeFile: string) {
   return target;
 }
 
+export function mapSkillMitigationEditsToConfiguredRoot(
+  configuredRoot: string,
+  kind: "repository" | "skill",
+  proposal: SkillMitigationEdit[],
+) {
+  if (kind === "repository") return proposal;
+  const prefix = `.github/skills/${path.basename(configuredRoot)}/`;
+  function mapFile(file: string) {
+    const normalized = file.replaceAll("\\", "/");
+    return normalized.toLowerCase().startsWith(prefix.toLowerCase())
+      ? normalized.slice(prefix.length)
+      : normalized;
+  }
+  return proposal.map((edit) => ({
+    ...edit,
+    file: mapFile(edit.file),
+    implementationPath: edit.implementationPath.map(mapFile),
+  }));
+}
+
 export async function applySkillMitigationEdits(
   configuredRoot: string,
   proposal: SkillMitigationEdit[],
@@ -272,17 +562,30 @@ export async function applySkillMitigationEdits(
     const current =
       updated.get(realTarget) ?? (await fs.readFile(realTarget, "utf8"));
     if (!originals.has(realTarget)) originals.set(realTarget, current);
+    if (!edit.replacement.startsWith(edit.search)) {
+      throw new Error(
+        `Apply stopped: ${edit.file} contains a replacement or removal. Automated Apply only permits append-only mitigations.`,
+      );
+    }
+    const addition = edit.replacement.slice(edit.search.length).trim();
+    if (!addition) continue;
+    const normalizedCurrent = current.replace(/\s+/g, " ").toLowerCase();
+    const normalizedAddition = addition.replace(/\s+/g, " ").toLowerCase();
+    if (normalizedCurrent.includes(normalizedAddition)) continue;
     const first = current.indexOf(edit.search);
     const second =
       first < 0 ? -1 : current.indexOf(edit.search, first + edit.search.length);
-    if (first < 0 || second >= 0) {
-      throw new Error(
-        `Apply stopped: ${edit.file} changed after this analysis, or the proposed target text is not unique. This is not caused by another Analyze job. Run Analyze again to create a proposal for the current file.`,
+    if (first >= 0 && second < 0) {
+      updated.set(
+        realTarget,
+        `${current.slice(0, first)}${edit.replacement}${current.slice(first + edit.search.length)}`,
       );
+      continue;
     }
+    const separator = current.length === 0 ? "" : current.endsWith("\n") ? "\n" : "\n\n";
     updated.set(
       realTarget,
-      `${current.slice(0, first)}${edit.replacement}${current.slice(first + edit.search.length)}`,
+      `${current}${separator}${addition}\n`,
     );
   }
   await fs.rm(backupRoot, { recursive: true, force: true });
@@ -341,13 +644,22 @@ export async function applySkillAnalysisResult(resultId: number) {
       "backups",
       `result-${result.id}`,
     );
-    await applySkillMitigationEdits(validated.resolved, proposal, backupRoot);
+    await applySkillMitigationEdits(
+      validated.resolved,
+      mapSkillMitigationEditsToConfiguredRoot(
+        validated.resolved,
+        validated.kind,
+        proposal,
+      ),
+      backupRoot,
+    );
     db.prepare(`
       UPDATE skill_analysis_results SET
         applied_at = ?, application_error = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(new Date().toISOString(), result.id);
   } catch (error) {
+    throwIfWorkflowCancelled(error);
     const message = error instanceof Error ? error.message : String(error);
     db.prepare(`
       UPDATE skill_analysis_results SET
@@ -405,11 +717,12 @@ export async function executeSkillAnalysisJob(job: SkillAnalysisJob) {
         job.model_secondary,
         job.context_tier,
       );
-      const analysis = await analyzePullRequest(job, skill, pr);
+      const analysis = await analyzePullRequest(job, repository, skill, pr);
       if (job.mode === "analyze_apply" && analysis.shouldApply) {
         await applySkillAnalysisResult(analysis.resultId);
       }
     } catch (error) {
+      throwIfWorkflowCancelled(error);
       const message = error instanceof Error ? error.message : String(error);
       errors.push(`PR ${pr ? `#${pr.number}` : prId}: ${message}`);
       db.prepare(`
@@ -441,7 +754,7 @@ export async function executeSkillAnalysisJob(job: SkillAnalysisJob) {
   db.prepare(`
     UPDATE skill_analysis_jobs SET
       status = 'completed', status_message = ?, error = ?, completed_at = ?
-    WHERE id = ?
+    WHERE id = ? AND status = 'running'
   `).run(
     errors.length > 0
       ? `Complete with ${errors.length} failure${errors.length === 1 ? "" : "s"}`

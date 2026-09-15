@@ -9,6 +9,10 @@ import {
 function createDb() {
   const db = new Database(":memory:");
   db.exec(`
+    CREATE TABLE personal_review_skills (
+      id INTEGER PRIMARY KEY,
+      execution_mode TEXT NOT NULL DEFAULT 'copilot-skill'
+    );
     CREATE TABLE personal_skill_results (
       id INTEGER PRIMARY KEY,
       skill_id INTEGER NOT NULL,
@@ -23,6 +27,7 @@ function createDb() {
       usage_json TEXT,
       metrics_json TEXT,
       raw_output_json TEXT,
+      skill_snapshot_path TEXT,
       repository_context_mode TEXT NOT NULL DEFAULT 'diff',
       repository_commit TEXT,
       error TEXT,
@@ -50,43 +55,83 @@ function createDb() {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(profile_id, pull_request_id)
     );
+    CREATE TABLE skill_analysis_results (
+      id INTEGER PRIMARY KEY,
+      skill_id INTEGER NOT NULL,
+      pull_request_id INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      model_secondary TEXT NOT NULL,
+      context_tier TEXT NOT NULL
+    );
   `);
   return db;
 }
 
 test("creates pending rows for every queued personal skill and PR", () => {
   const db = createDb();
+  db.exec(`
+    INSERT INTO personal_review_skills (id, execution_mode)
+    VALUES (10, 'copilot-skill'), (11, 'devloop-local');
+  `);
   queuePersonalSkillResults(db, {
     skillIds: [10, 11],
     pullRequestIds: [20, 21],
     model: "gpt-5.6-sol",
-    modelSecondary: "none",
+    modelSecondary: "gpt-5.6-terra",
     contextTier: "default",
   });
   const rows = db
     .prepare(`
-      SELECT skill_id, pull_request_id, status
+      SELECT skill_id, pull_request_id, model_secondary, status
       FROM personal_skill_results
       ORDER BY skill_id, pull_request_id
     `)
     .all();
   assert.deepEqual(rows, [
-    { skill_id: 10, pull_request_id: 20, status: "pending" },
-    { skill_id: 10, pull_request_id: 21, status: "pending" },
-    { skill_id: 11, pull_request_id: 20, status: "pending" },
-    { skill_id: 11, pull_request_id: 21, status: "pending" },
+    {
+      skill_id: 10,
+      pull_request_id: 20,
+      model_secondary: "gpt-5.6-terra",
+      status: "pending",
+    },
+    {
+      skill_id: 10,
+      pull_request_id: 21,
+      model_secondary: "gpt-5.6-terra",
+      status: "pending",
+    },
+    {
+      skill_id: 11,
+      pull_request_id: 20,
+      model_secondary: "none",
+      status: "pending",
+    },
+    {
+      skill_id: 11,
+      pull_request_id: 21,
+      model_secondary: "none",
+      status: "pending",
+    },
   ]);
   db.close();
 });
 
 test("clears stale output when a skill or baseline result is requeued", () => {
   const db = createDb();
+  db.prepare(
+    "INSERT INTO personal_review_skills (id, execution_mode) VALUES (1, 'copilot-skill')",
+  ).run();
   db.prepare(`
     INSERT INTO personal_skill_results (
       skill_id, pull_request_id, model, model_secondary, context_tier,
-      status, findings_json, error, completed_at
+      status, findings_json, skill_snapshot_path, error, completed_at
     ) VALUES (1, 2, 'gpt-5.6-sol', 'none', 'default',
-      'completed', '[]', 'old', '2026-09-07T00:00:00.000Z')
+      'completed', '[]', 'Q:\\snapshot', 'old', '2026-09-07T00:00:00.000Z')
+  `).run();
+  db.prepare(`
+    INSERT INTO skill_analysis_results (
+      id, skill_id, pull_request_id, model, model_secondary, context_tier
+    ) VALUES (4, 1, 2, 'gpt-5.6-sol', 'none', 'default')
   `).run();
   db.prepare(`
     INSERT INTO baseline_profile_results (
@@ -109,16 +154,21 @@ test("clears stale output when a skill or baseline result is requeued", () => {
   assert.deepEqual(
     db
       .prepare(`
-        SELECT status, findings_json, error, completed_at
+        SELECT status, findings_json, skill_snapshot_path, error, completed_at
         FROM personal_skill_results
       `)
       .get(),
     {
       status: "pending",
       findings_json: null,
+      skill_snapshot_path: null,
       error: null,
       completed_at: null,
     },
+  );
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS count FROM skill_analysis_results").get(),
+    { count: 0 },
   );
   assert.deepEqual(
     db

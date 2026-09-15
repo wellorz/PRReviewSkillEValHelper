@@ -27,6 +27,7 @@ const settingsSchema = z.object({
   modelSecondary: z.string().trim().min(1),
   contextTier: z.enum(["default", "long_context"]),
   baselineConcurrency: z.number().int().min(1).max(20),
+  buildKnowledgeGraph: z.boolean(),
   localRepoPath: z.string().trim().optional(),
   localRepoBranch: z.string().trim().min(1),
 });
@@ -96,6 +97,56 @@ type SkillAnalysisResultRow = {
   applied_at: string | null;
   application_error: string | null;
 };
+
+type TrainingJobRow = {
+  id: number;
+  skill_id: number;
+  skill_name: string;
+  status: string;
+  pr_ids_json: string;
+  current_iteration: number;
+  max_iterations: number;
+  current_item: number;
+  total_items: number;
+  current_pr_ids_json: string;
+  status_message: string;
+  history_json: string;
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
+};
+
+function numericIds(value: string) {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is number => Number.isInteger(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function trainingScore(value: string | null) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const metrics =
+      parsed.skilled && typeof parsed.skilled === "object"
+        ? (parsed.skilled as Record<string, unknown>)
+        : parsed;
+    const earned = Number(metrics.earnedPoints ?? metrics.truePositives ?? 0);
+    return {
+      earned,
+      available: Number(
+        metrics.availablePoints ??
+          earned + Number(metrics.falseNegatives ?? 0),
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
 
 function findings(json: string | null): ModelFinding[] {
   if (!json) return [];
@@ -173,7 +224,8 @@ export async function GET(
   const pullRequests = db
     .prepare(`
       SELECT id, number, title, url, author, updated_at, changed_files,
-        valued_comment_count, selected, manual, defect_description, dataset_path,
+        valued_comment_count, select_level, selected, manual,
+        defect_description, dataset_path,
         baseline_status, baseline_duration_ms, baseline_metrics_json,
         baseline_findings_json, baseline_error, baseline_completed_at,
         skill_status, skill_duration_ms, skill_metrics_json, skill_error,
@@ -365,7 +417,7 @@ export async function GET(
       SELECT id, kind, status, current_item, total_items, status_message,
         error, created_at, completed_at
       FROM workflow_tasks
-      WHERE repository_id = ?
+      WHERE repository_id = ? AND training_job_id IS NULL
       ORDER BY id DESC
       LIMIT 20
     `)
@@ -376,11 +428,143 @@ export async function GET(
         pr_ids_json, status, current_item, total_items, status_message,
         error, created_at, completed_at
       FROM skill_analysis_jobs
-      WHERE repository_id = ?
+      WHERE repository_id = ? AND training_job_id IS NULL
       ORDER BY id DESC
       LIMIT 20
     `)
     .all(id);
+  const trainingJobs = db
+    .prepare(`
+      SELECT training.id, training.skill_id, skill.name AS skill_name,
+        training.status, training.pr_ids_json, training.current_iteration,
+        training.max_iterations, training.current_item, training.total_items,
+        training.current_pr_ids_json, training.status_message,
+        training.history_json, training.error, training.created_at,
+        training.completed_at
+      FROM skill_training_jobs training
+      JOIN personal_review_skills skill ON skill.id = training.skill_id
+      WHERE training.repository_id = ?
+      ORDER BY training.id DESC
+      LIMIT 10
+    `)
+    .all(id) as TrainingJobRow[];
+  const skillTrainingJobs = trainingJobs.map((training) => {
+    const prIds = numericIds(training.pr_ids_json);
+    const reviewTasks = db
+      .prepare(`
+        SELECT id, status, pr_ids_json, training_iteration
+        FROM workflow_tasks
+        WHERE training_job_id = ?
+        ORDER BY training_iteration ASC
+      `)
+      .all(training.id) as Array<{
+      id: number;
+      status: string;
+      pr_ids_json: string;
+      training_iteration: number;
+    }>;
+    const analysisTasks = db
+      .prepare(`
+        SELECT id, status, pr_ids_json, training_iteration
+        FROM skill_analysis_jobs
+        WHERE training_job_id = ?
+        ORDER BY training_iteration ASC
+      `)
+      .all(training.id) as Array<{
+      id: number;
+      status: string;
+      pr_ids_json: string;
+      training_iteration: number;
+    }>;
+    const resultRows =
+      prIds.length === 0
+        ? []
+        : (db
+            .prepare(`
+              SELECT pull_request_id, status, metrics_json, error, updated_at
+              FROM personal_skill_results
+              WHERE skill_id = ?
+                AND pull_request_id IN (${prIds.map(() => "?").join(",")})
+              ORDER BY updated_at DESC, id DESC
+            `)
+            .all(training.skill_id, ...prIds) as Array<{
+            pull_request_id: number;
+            status: string;
+            metrics_json: string | null;
+            error: string | null;
+            updated_at: string;
+          }>);
+    const latestResultByPr = new Map<
+      number,
+      (typeof resultRows)[number]
+    >();
+    for (const row of resultRows) {
+      if (!latestResultByPr.has(row.pull_request_id)) {
+        latestResultByPr.set(row.pull_request_id, row);
+      }
+    }
+    const pullRequestById = new Map(
+      pullRequests.map((pr) => [
+        pr.id,
+        { number: Number(pr.number), title: String(pr.title) },
+      ]),
+    );
+    return {
+      ...training,
+      pr_progress: prIds.map((pullRequestId) => {
+        const reviewAttempts = reviewTasks.filter((task) =>
+          numericIds(task.pr_ids_json).includes(pullRequestId),
+        );
+        const analysisAttempt = [...analysisTasks]
+          .reverse()
+          .find(
+            (task) =>
+              numericIds(task.pr_ids_json).includes(pullRequestId) &&
+              ["queued", "running", "cancelling"].includes(task.status),
+          );
+        const reviewAttempt = [...reviewAttempts]
+          .reverse()
+          .find((task) =>
+            ["queued", "running", "cancelling"].includes(task.status),
+          );
+        const latestResult = latestResultByPr.get(pullRequestId);
+        const score = trainingScore(latestResult?.metrics_json ?? null);
+        let reviewStatus = "Waiting";
+        if (training.status === "cancelling") {
+          reviewStatus = "Cancelling";
+        } else if (analysisAttempt) {
+          reviewStatus = "Analyzing and mitigating gap";
+        } else if (latestResult?.status === "failed") {
+          reviewStatus = "Review failed";
+        } else if (latestResult?.status === "completed" && score) {
+          reviewStatus =
+            score.available > 0 && score.earned === 0
+              ? "Zero credit"
+              : "Earned credit";
+        } else if (reviewAttempt) {
+          reviewStatus =
+            reviewAttempt.training_iteration > 0 ? "Retrying review" : "Reviewing";
+        } else if (training.status === "completed") {
+          reviewStatus = "Training complete";
+        } else if (latestResult?.status) {
+          reviewStatus = latestResult.status;
+        }
+        const pullRequest = pullRequestById.get(pullRequestId);
+        return {
+          pullRequestId,
+          number: pullRequest?.number ?? pullRequestId,
+          title: pullRequest?.title ?? "Unknown PR",
+          status: reviewStatus,
+          retries: reviewAttempts.filter(
+            (task) => task.training_iteration > 0,
+          ).length,
+          earned: score?.earned ?? null,
+          available: score?.available ?? null,
+          error: latestResult?.error ?? null,
+        };
+      }),
+    };
+  });
   return NextResponse.json({
     repository,
     pullRequests: scoredPullRequests,
@@ -391,6 +575,7 @@ export async function GET(
     skillResults: scoredSkillRows,
     skillAnalysisResults: skillAnalysisRows,
     skillAnalysisJobs: analysisJobs,
+    skillTrainingJobs,
     baselineSummaries,
     skillSummaries,
   });
@@ -463,6 +648,7 @@ export async function PATCH(
         model_secondary = ?,
         context_tier = ?,
         baseline_concurrency = ?,
+        build_knowledge_graph = ?,
         local_repo_path = CASE WHEN ? = 1 THEN ? ELSE local_repo_path END,
         local_repo_branch = CASE WHEN ? = 1 THEN ? ELSE local_repo_branch END,
         local_repo_warning = CASE WHEN ? = 1 THEN ? ELSE local_repo_warning END,
@@ -475,6 +661,7 @@ export async function PATCH(
       modelSecondary,
       parsed.data.contextTier,
       parsed.data.baselineConcurrency,
+      parsed.data.buildKnowledgeGraph ? 1 : 0,
       updateLocalRepoPath ? 1 : 0,
       localRepoPath,
       updateLocalRepoBranch ? 1 : 0,

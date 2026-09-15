@@ -45,6 +45,16 @@ test("matching combines location and semantic overlap", () => {
   assert.equal(matchFindings([human], [matching]).length, 1);
 });
 
+test("explicit rejection blocks an otherwise automatic match", () => {
+  assert.equal(
+    matchFindings(
+      [human],
+      [{ ...matching, rejectedHumanFindingIds: [human.id] }],
+    ).length,
+    0,
+  );
+});
+
 test("matching does not credit a finding from a different PR iteration", () => {
   assert.equal(
     matchFindings(
@@ -145,6 +155,151 @@ test("semantic overlap does not override a conflicting human file location", () 
     ).length,
     0,
   );
+});
+
+test("matching leaves distant same-file defects for manual adjudication", () => {
+  const expected = {
+    ...human,
+    normalizedBody:
+      "When tenant-upgrade events are logged, separate calls duplicate the logging " +
+      "logic instead of routing the event through a single logging path, allowing " +
+      "message, severity, or tenant context to diverge between outputs and produce " +
+      "inconsistent logs.",
+    path: "src/TenantHelper.cs",
+    line: 181,
+    originalLine: 181,
+  };
+  const finding = {
+    ...matching,
+    title: "Direct sink duplicates the logger wrapper",
+    description:
+      "The same wrapper/direct-sink duplication occurs in the surrounding upgrade " +
+      "and hydration paths, producing duplicate event counts and divergent exception " +
+      "payloads. Keep sink fan-out in the logger wrappers and remove adjacent direct " +
+      "calls or centralize ownership in one shared abstraction.",
+    evidence:
+      "The logger wrapper already writes to the sink before the caller writes directly.",
+    file: "src/TenantHelper.cs",
+    lineStart: 257,
+    lineEnd: 257,
+  };
+
+  assert.equal(matchFindings([expected], [finding]).length, 0);
+});
+
+test("same-file distant matching still rejects an unrelated defect", () => {
+  const expected = {
+    ...human,
+    normalizedBody:
+      "Separate logging calls duplicate sink ownership and can produce inconsistent logs.",
+    path: "src/TenantHelper.cs",
+    line: 181,
+    originalLine: 181,
+  };
+  const finding = {
+    ...matching,
+    title: "Retry transient directory failures",
+    description:
+      "The tenant lookup exits after one transient request failure and never applies " +
+      "the configured retry delay.",
+    evidence: "Only one directory request is attempted.",
+    file: "src/TenantHelper.cs",
+    lineStart: 500,
+    lineEnd: 500,
+  };
+
+  assert.equal(matchFindings([expected], [finding]).length, 0);
+});
+
+test("same line does not credit a different defect with weak text overlap", () => {
+  const expected = {
+    ...human,
+    id: "canonical-entity-type",
+    iterationId: 11,
+    normalizedBody:
+      "The reconciliation code derives entityType from config.Id.Name instead of the canonical " +
+      "SoA entity-type definition, causing lockdown throttling and status updates to target the wrong entity.",
+    path: "src/SoAConfigOperations.cs",
+    line: 217,
+    originalLine: 217,
+  };
+  const finding = {
+    ...matching,
+    iterationId: 11,
+    title: "Resource-forest regex is unanchored",
+    description:
+      "A forest short name containing the resource-forest pattern is classified incorrectly.",
+    evidence: "Regex.IsMatch is used without start and end anchors.",
+    file: "src/SoAConfigOperations.cs",
+    lineStart: 217,
+    lineEnd: 217,
+  };
+
+  assert.equal(matchFindings([expected], [finding]).length, 0);
+});
+
+test("same-file subsystem overlap does not credit a different mechanism", () => {
+  const expected = {
+    ...human,
+    id: "resource-forest-name",
+    iterationId: 8,
+    normalizedBody:
+      "The resource forest regex rejects a short name such as namp111 and creates the directory " +
+      "session with the wrong AD scope.",
+    path: "src/SoAConfigOperations.cs",
+    line: 65,
+    originalLine: 65,
+  };
+  const finding = {
+    ...matching,
+    iterationId: 8,
+    title: "Lockdown throttle enumerates all types",
+    description:
+      "The lockdown count query materializes unrelated entity types and filters them in memory.",
+    evidence: "CountEntitiesInLockdownPhase scans every migration status configuration.",
+    file: "src/SoAConfigOperations.cs",
+    lineStart: 180,
+    lineEnd: 180,
+  };
+
+  assert.equal(matchFindings([expected], [finding]).length, 0);
+});
+
+test("explicit human adjudication credits the exact model finding", () => {
+  const finding = {
+    ...matching,
+    title: "Different wording",
+    description: "A manually reviewed equivalent defect.",
+    evidence: "The semantic audit confirmed the same causal mechanism.",
+    adjudicatedHumanFindingIds: [human.id],
+  };
+
+  const matches = matchFindings([human], [finding]);
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0]?.humanFindingId, human.id);
+  assert.equal(matches[0]?.modelFindingIndex, 0);
+});
+
+test("explicit adjudication can credit a defect confirmed to exist in an earlier iteration", () => {
+  const finding = {
+    ...matching,
+    iterationId: 8,
+    adjudicatedHumanFindingIds: [human.id],
+  };
+
+  const matches = matchFindings([{ ...human, iterationId: 10 }], [finding]);
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0]?.score, 2);
+});
+
+test("explicit adjudication still enforces one finding per credit", () => {
+  const secondHuman = { ...human, id: "review-comment-2" };
+  const finding = {
+    ...matching,
+    adjudicatedHumanFindingIds: [human.id, secondHuman.id],
+  };
+
+  assert.equal(matchFindings([human, secondHuman], [finding]).length, 1);
 });
 
 test("paired scoring selects the stronger review", () => {

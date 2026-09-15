@@ -41,6 +41,67 @@ test("restores findings suppressed by the former per-PR credit cap", () => {
   assert.deepEqual(restored[0].valueReasons, ["actionable-language"]);
 });
 
+test("credits only approved Azure selection provenance", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "azure-ground-truth-"));
+  const strictFinding = {
+    ...finding("azure-thread-1-comment-1", 5),
+    valueReasons: ["actionable-language", "pr-owner-confirmed"],
+  };
+  const resolvedFinding = {
+    ...finding("azure-thread-2-comment-1", 5),
+    valueReasons: ["actionable-language", "resolved-thread"],
+  };
+  const unclassifiedFinding = {
+    ...finding("azure-thread-3-comment-1", 5),
+    valueReasons: ["actionable-language"],
+  };
+  await Promise.all([
+    fs.writeFile(
+      path.join(root, "review-snapshots.json"),
+      JSON.stringify({
+        version: 1,
+        snapshots: [
+          {
+            key: "final",
+            iterationId: 1,
+            sourceCommit: "source",
+            targetCommit: "target",
+            isFinal: true,
+            relativePath: ".",
+            findingIds: [
+              strictFinding.id,
+              resolvedFinding.id,
+              unclassifiedFinding.id,
+            ],
+          },
+        ],
+      }),
+    ),
+    fs.writeFile(
+      path.join(root, "human-findings.json"),
+      JSON.stringify([
+        strictFinding,
+        resolvedFinding,
+        unclassifiedFinding,
+      ]),
+    ),
+  ]);
+  try {
+    const snapshots = await loadReviewSnapshots({
+      id: 1,
+      dataset_path: root,
+      defect_description: null,
+      url: "https://example.test/pr/1",
+    });
+    assert.deepEqual(
+      snapshots[0].truth.map((item) => item.scorePoint),
+      [1, 1, 0],
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("assigns curator defects to the final iteration snapshot", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "review-snapshots-"));
   const iteration2 = path.join(root, "iterations", "iteration-2");

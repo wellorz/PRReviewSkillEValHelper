@@ -5,32 +5,189 @@ import test from "node:test";
 import {
   localOnlyCopilotPermissionArgs,
   localOnlySandboxSettings,
+  nativeWzReviewArtifactError,
   nativeWzReviewPrompt,
   nativeReviewerModels,
+  parseCodeReadingKnowledgeOutput,
+  parseSkillAnalysisOutput,
   parseNativeWzReviewResult,
   parseReviewOutput,
+  prepareSkillRoot,
   reviewPrompt,
   validateSkillPath,
 } from "@/lib/copilot";
+import {
+  DEFAULT_PERSONAL_SKILL_TRIGGER_INSTRUCTION,
+  personalSkillTriggerInstruction,
+  validatePersonalSkillTriggerInstruction,
+} from "@/lib/personal-skill-trigger";
+
+test("parses and bounds repository-backed code-reading knowledge", () => {
+  const output = parseCodeReadingKnowledgeOutput(
+    JSON.stringify({
+      summary: "The callback controls durable state.",
+      gapType: "lifecycle and ownership",
+      symbols: [
+        {
+          name: "CompleteOperation",
+          kind: "method",
+          sourcePath: "src/Operation.cs",
+          purpose: "Finalize the operation.",
+          usages: ["Called after persistence."],
+          similarSymbols: [
+            {
+              name: "CancelOperation",
+              sourcePath: "src/Operation.cs",
+              similarities: "Both finish an operation.",
+              differences: "Cancellation does not persist success.",
+            },
+          ],
+          inputs: [
+            {
+              name: "status",
+              type: "Status",
+              validValues: "Success or Failure",
+              invalidBehavior: "Throws.",
+            },
+          ],
+          outputs: [
+            {
+              name: "result",
+              type: "Task",
+              expectedValues: "Completed task",
+              meaning: "Persistence completed.",
+            },
+          ],
+          errorBehavior: ["Storage failures propagate."],
+          dependencies: [
+            {
+              name: "store",
+              kind: "field",
+              relationship: "Persists final state.",
+            },
+          ],
+          callFlow: ["Caller -> CompleteOperation -> store"],
+          invariants: ["State is persisted before completion is visible."],
+          evidence: ["src/Operation.cs:42"],
+          uncertainties: [],
+        },
+      ],
+    }),
+  );
+
+  assert.equal(output.gapType, "lifecycle and ownership");
+  assert.equal(output.symbols[0]?.name, "CompleteOperation");
+  assert.equal(output.symbols[0]?.inputs[0]?.validValues, "Success or Failure");
+});
+
+test("parses change-first skill mitigation reasoning", () => {
+  const output = parseSkillAnalysisOutput(
+    JSON.stringify({
+      summary: "The review missed a compatibility regression.",
+      commentAssessmentStatus: "supported",
+      changeAndCommentAssessment:
+        "The comment is supported by the changed classifier contract.",
+      assessmentEvidence: [
+        "The legacy and replacement classifiers accept different DN forms.",
+      ],
+      escalation: "",
+      reviewAspect: "compatibility and correctness",
+      prevention:
+        "Authors and reviewers should compare old and new classification boundaries.",
+      skillGap:
+        "The responsible reviewer does not require contract-boundary comparison.",
+      whyMissed: "The delegated reviewer checked only the new helper.",
+      mitigation: "Require old-versus-new contract analysis.",
+      edits: [],
+    }),
+  );
+
+  assert.equal(
+    output.changeAndCommentAssessment,
+    "The comment is supported by the changed classifier contract.",
+  );
+  assert.equal(output.commentAssessmentStatus, "supported");
+  assert.equal(output.assessmentEvidence.length, 1);
+  assert.equal(output.reviewAspect, "compatibility and correctness");
+  assert.match(output.prevention, /Authors and reviewers/);
+  assert.match(output.skillGap, /contract-boundary comparison/);
+});
+
+test("escalates disputed comments without returning mitigation edits", () => {
+  const output = parseSkillAnalysisOutput(
+    JSON.stringify({
+      summary: "The human claim is not established.",
+      commentAssessmentStatus: "unsupported",
+      changeAndCommentAssessment:
+        "The named path is unchanged and the alleged call is unreachable.",
+      assessmentEvidence: [
+        "diff.patch does not modify the classifier.",
+        "The caller returns before the alleged path.",
+      ],
+      escalation:
+        "A human should verify whether another snapshot contains the claimed change.",
+      reviewAspect: "correctness",
+      prevention: "Confirm the executable path before filing the defect.",
+      skillGap: "No skill gap is established.",
+      whyMissed: "The review did not report an unsupported claim.",
+      mitigation: "No mitigation should be applied.",
+      edits: [
+        {
+          file: "SKILL.md",
+          search: "existing",
+          replacement: "existing\nunsafe lesson",
+          rationale: "Should be suppressed.",
+          targetKind: "orchestration",
+          implementationPath: ["SKILL.md"],
+        },
+      ],
+    }),
+  );
+
+  assert.equal(output.commentAssessmentStatus, "unsupported");
+  assert.equal(output.assessmentEvidence.length, 2);
+  assert.match(output.escalation, /human should verify/i);
+  assert.deepEqual(output.edits, []);
+});
 
 test("builds native wzReview prompts for commit and diff-only modes", () => {
-  assert.equal(
-    nativeWzReviewPrompt({
+  const commitPrompt = nativeWzReviewPrompt({
       repositoryRoot: "Q:\\repo",
       outputFolder: "Q:\\output",
       sourceCommit: "source",
       targetCommit: "target",
-    }),
-    '/wz-review source "Q:\\output" --base target',
-  );
-  assert.equal(
-    nativeWzReviewPrompt({
+    });
+  const diffPrompt = nativeWzReviewPrompt({
       repositoryRoot: "Q:\\snapshot with spaces",
       outputFolder: "Q:\\output with spaces",
       diffOnly: true,
-    }),
-    '/wz-review "Q:\\snapshot with spaces" "Q:\\output with spaces" --diff-only',
+    });
+  assert.match(commitPrompt, /^\/wz-review source "Q:\\output" --base target/);
+  assert.match(
+    diffPrompt,
+    /^\/wz-review "Q:\\snapshot with spaces" "Q:\\output with spaces" --diff-only/,
   );
+  for (const prompt of [commitPrompt, diffPrompt]) {
+    assert.match(prompt, /Never launch a background agent/);
+    assert.match(prompt, /review-result\.yaml and review\.md both exist/);
+    assert.match(prompt, /permanently local-only/);
+  }
+});
+
+test("reports unsupported Windows sandboxing instead of missing artifacts", () => {
+  const message = nativeWzReviewArtifactError(
+    {
+      stdout:
+        "Blocked: Windows sandboxing requires BaseContainer. No review artifacts were created.",
+      stderr:
+        "Warning: Sandboxing is enabled but is not supported on this host.",
+    },
+    ["source.yaml", "review-result.yaml"],
+  );
+
+  assert.match(message, /requires BaseContainer/);
+  assert.match(message, /Sandbox enforcement was not bypassed/);
+  assert.doesNotMatch(message, /did not create required artifacts/);
 });
 
 test("keeps baseline and personal-skill reviews permanently local", () => {
@@ -50,8 +207,59 @@ test("keeps baseline and personal-skill reviews permanently local", () => {
     sourceCommit: "source",
     targetCommit: "target",
   });
+
+  test("uses saved personal-skill trigger instructions", () => {
+    const instruction =
+      "Prioritize compatibility regressions and verify every changed contract.";
+    const prompt = reviewPrompt("contract-review", instruction);
+    assert.match(prompt, new RegExp(instruction));
+    assert.match(prompt, /loaded skill is named `contract-review`/);
+    assert.equal(
+      personalSkillTriggerInstruction("  "),
+      DEFAULT_PERSONAL_SKILL_TRIGGER_INSTRUCTION,
+    );
+    assert.equal(
+      validatePersonalSkillTriggerInstruction(`  ${instruction}  `),
+      instruction,
+    );
+    assert.throws(
+      () =>
+        validatePersonalSkillTriggerInstruction(
+          "Run the review with --allowpublish",
+        ),
+      /permanently local-only/,
+    );
+    assert.throws(
+      () =>
+        validatePersonalSkillTriggerInstruction(
+          'copilot -p "Review this snapshot" --model gpt-5.6-sol',
+        ),
+      /not the full Copilot command/,
+    );
+  });
+
+  test("keeps the native command while appending its saved instruction", () => {
+    const prompt = nativeWzReviewPrompt({
+      repositoryRoot: "Q:\\repo",
+      outputFolder: "Q:\\output",
+      sourceCommit: "source",
+      targetCommit: "target",
+      triggerInstruction: "Focus on recovery and durable progress.",
+    });
+    assert.match(
+      prompt,
+      /^\/wz-review source "Q:\\output" --base target/,
+    );
+    assert.match(prompt, /Additional benchmark review instruction/);
+    assert.match(prompt, /Focus on recovery and durable progress/);
+    assert.match(prompt, /permanently local-only/);
+    assert.doesNotMatch(
+      prompt.split(/\r?\n/, 1)[0],
+      /--allowpublish|--autopublish-active|--publish-existing/,
+    );
+  });
   assert.doesNotMatch(
-    nativePrompt,
+    nativePrompt.split(/\r?\n/, 1)[0],
     /--allowpublish|--autopublish-active|--publish-existing/,
   );
 });
@@ -99,6 +307,28 @@ test("blocks review subprocess network access and credential injection", () => {
   ]);
 });
 
+test("trusted native wzReview explicitly disables the unsupported sandbox", () => {
+  const args = localOnlyCopilotPermissionArgs(["substratemcp"], {
+    sandbox: false,
+  });
+  assert.ok(!args.includes("--sandbox"));
+  assert.ok(args.includes("--no-sandbox"));
+  assert.ok(args.includes("--experimental"));
+  assert.ok(args.includes("--deny-url=*"));
+  assert.ok(args.includes("--disable-builtin-mcps"));
+  assert.ok(args.includes("--disable-mcp-server"));
+  assert.ok(args.includes("substratemcp"));
+  assert.ok(args.includes("--no-remote"));
+  assert.ok(
+    args.some(
+      (arg) =>
+        arg.startsWith("--secret-env-vars=") &&
+        arg.includes("AZURE_DEVOPS_EXT_PAT") &&
+        arg.includes("GH_TOKEN"),
+    ),
+  );
+});
+
 test("repairs unquoted code and punctuation in native wzReview YAML", () => {
   const parsed = parseNativeWzReviewResult(`
 reviewSummary:
@@ -125,6 +355,29 @@ rejectedCandidates:
   assert.equal(
     rejected[0].reason,
     'The value is intentional: it represents "not resolved".',
+  );
+});
+
+test("preserves valid wrapped native wzReview YAML scalars", () => {
+  const parsed = parseNativeWzReviewResult(`
+reviewSummary:
+  totalFindings: 1
+findings:
+- id: reader-mode-skew
+  finding: The reader snapshots its mode at construction, while classifiers
+    read the live gate and can observe a different mode.
+  evidence: Reader.cs:10-12 captures the mode, while Classifier.cs:20-22
+    retrieves the current configuration.
+  suggestion: Carry one effective mode through the operation.
+`);
+  const findings = parsed.findings as Array<Record<string, unknown>>;
+  assert.equal(
+    findings[0].finding,
+    "The reader snapshots its mode at construction, while classifiers read the live gate and can observe a different mode.",
+  );
+  assert.equal(
+    findings[0].evidence,
+    "Reader.cs:10-12 captures the mode, while Classifier.cs:20-22 retrieves the current configuration.",
   );
 });
 
@@ -253,6 +506,44 @@ test("validates direct skills and repository skill roots", async () => {
     await fs.writeFile(path.join(direct, "SKILL.md"), "# Test");
     await fs.mkdir(path.join(repository, ".github", "skills"), {
       recursive: true,
+    });
+
+    test("prepares an immutable copy of repository-style skills", async () => {
+      const root = path.join(
+        process.cwd(),
+        "runtime",
+        `skill-copy-${process.pid}`,
+      );
+      const repository = path.join(root, "repository");
+      const runtime = path.join(root, "runtime");
+      const sourceSkill = path.join(
+        repository,
+        ".github",
+        "skills",
+        "generated-review",
+      );
+      try {
+        await fs.mkdir(sourceSkill, { recursive: true });
+        await fs.writeFile(path.join(sourceSkill, "SKILL.md"), "original");
+        const prepared = await prepareSkillRoot(repository, runtime);
+        await fs.writeFile(path.join(sourceSkill, "SKILL.md"), "changed");
+        assert.equal(
+          await fs.readFile(
+            path.join(
+              prepared,
+              ".github",
+              "skills",
+              "generated-review",
+              "SKILL.md",
+            ),
+            "utf8",
+          ),
+          "original",
+        );
+        assert.notEqual(prepared, repository);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
     });
     assert.equal((await validateSkillPath(direct)).kind, "skill");
     assert.deepEqual(await validateSkillPath(path.join(direct, "SKILL.md")), {

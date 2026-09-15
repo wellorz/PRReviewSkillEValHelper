@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   azureHumanFindings,
+  GitOperationError,
+  isEligibleResolvedThreadStatus,
   isExplicitOwnerConfirmation,
+  pullRequestNumbersFromCommitHistory,
+  retryGitOperation,
 } from "@/lib/azure-devops";
 
 const reviewer = {
@@ -34,10 +38,11 @@ function thread(
   id: number,
   review: string,
   ownerReply: string,
+  status = "fixed",
 ) {
   return {
     id,
-    status: "fixed",
+    status,
     threadContext: {
       filePath: "/src/example.ts",
       rightFileStart: { line: 12 },
@@ -110,4 +115,92 @@ test("does not credit confirmed test-only feedback", () => {
   assert.equal(findings.length, 0);
   assert.equal(isExplicitOwnerConfirmation("It should be possible."), false);
   assert.equal(isExplicitOwnerConfirmation("Good catch, thanks!"), true);
+});
+
+test("accepts custom owner confirmation phrases", () => {
+  assert.equal(
+    isExplicitOwnerConfirmation(
+      "Confirmed by the service owner.",
+      ["confirmed by the service owner"],
+    ),
+    true,
+  );
+});
+
+test("collects substantive resolved comments without owner confirmation", () => {
+  const findings = azureHumanFindings(
+    pr,
+    [
+      thread(
+        4,
+        "This incorrectly skips the required cache refresh and leaves stale data.",
+        "Investigating.",
+        "fixed",
+      ),
+      thread(
+        5,
+        "This incorrectly skips the required cache refresh.",
+        "Investigating.",
+        "pending",
+      ),
+      thread(6, "Nit: rename this local variable.", "Done.", "fixed"),
+    ],
+    [],
+    [],
+    { mode: "resolved_comments" },
+  );
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].id, "azure-thread-4-comment-1");
+  assert.ok(findings[0].valueReasons.includes("resolved-thread"));
+});
+
+test("recognizes only accepted resolved thread dispositions", () => {
+  assert.equal(isEligibleResolvedThreadStatus("fixed"), true);
+  assert.equal(isEligibleResolvedThreadStatus("closed"), true);
+  assert.equal(isEligibleResolvedThreadStatus("resolved"), true);
+  assert.equal(isEligibleResolvedThreadStatus("active"), false);
+  assert.equal(isEligibleResolvedThreadStatus("pending"), false);
+  assert.equal(isEligibleResolvedThreadStatus("wontFix"), false);
+  assert.equal(isEligibleResolvedThreadStatus("byDesign"), false);
+});
+
+test("retries a PR Git operation up to three times", async () => {
+  let attempts = 0;
+  const result = await retryGitOperation(
+    async () => {
+      attempts += 1;
+      if (attempts < 4) throw new GitOperationError("git timed out");
+      return "complete";
+    },
+    { delayMs: 0 },
+  );
+  assert.equal(result, "complete");
+  assert.equal(attempts, 4);
+});
+
+test("gives up a PR after the third Git retry", async () => {
+  let attempts = 0;
+  await assert.rejects(
+    retryGitOperation(
+      async () => {
+        attempts += 1;
+        throw new GitOperationError("git timed out");
+      },
+      { delayMs: 0 },
+    ),
+    GitOperationError,
+  );
+  assert.equal(attempts, 4);
+});
+
+test("extracts unique PRs from path history in server order", () => {
+  assert.deepEqual(
+    pullRequestNumbersFromCommitHistory([
+      { comment: "Merged PR 5628552: First change" },
+      { comment: "ordinary commit" },
+      { comment: "merged pr 5628000: Second change" },
+      { comment: "Merged PR 5628552: Duplicate merge entry" },
+    ]),
+    [5628552, 5628000],
+  );
 });

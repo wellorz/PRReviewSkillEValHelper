@@ -2,6 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { getDb } from "@/lib/db";
 import {
+  normalizeCollectionMode,
+  parseConfirmationWords,
+  selectionLevelForMode,
+  type CollectionMode,
+} from "@/lib/collection-policy";
+import {
   findReusablePullRequests,
   type ExistingDatasetPullRequest,
 } from "@/lib/dataset-preservation";
@@ -10,6 +16,8 @@ import { prDatasetDir, repositoryDatasetDir } from "@/lib/paths";
 import { runCommand } from "@/lib/process";
 import {
   parsePathFilters,
+  prCreatedOnOrBefore,
+  prNumberMatchesRange,
   reviewableChangedFilePaths,
 } from "@/lib/repository-source";
 import { humanFindingScorePoint, scoreHumanComment } from "@/lib/github";
@@ -18,10 +26,15 @@ import {
   cachedScanOutcome,
   completeDatasetScan,
   recordCachedScan,
+  recordScanFailure,
   recordScanOutcome,
   scanScope,
   type ScanCandidate,
 } from "@/lib/scan-ledger";
+import {
+  throwIfWorkflowCancelled,
+  WorkflowCancellationError,
+} from "@/lib/workflow-cancellation";
 import type {
   HumanFinding,
   RepositoryRecord,
@@ -92,6 +105,10 @@ type AzurePullRequestIterationChanges = {
   }>;
 };
 
+type AzureCommit = {
+  comment?: string | null;
+};
+
 let azureCliInvocation:
   | Promise<{ command: string; prefixArgs: string[] }>
   | undefined;
@@ -101,15 +118,45 @@ function getAzureCliInvocation() {
     if (process.platform !== "win32") {
       return { command: "az", prefixArgs: [] };
     }
+
     const located = await runCommand("where.exe", ["az.cmd"], {
       timeoutMs: 10_000,
     });
-    if (located.exitCode !== 0) {
+    let launcher = located.stdout.split(/\r?\n/).find(Boolean)?.trim();
+    if (!launcher) {
+      const candidates = [
+        process.env.ProgramFiles
+          ? path.join(
+              process.env.ProgramFiles,
+              "Microsoft SDKs",
+              "Azure",
+              "CLI2",
+              "wbin",
+              "az.cmd",
+            )
+          : null,
+        process.env["ProgramFiles(x86)"]
+          ? path.join(
+              process.env["ProgramFiles(x86)"],
+              "Microsoft SDKs",
+              "Azure",
+              "CLI2",
+              "wbin",
+              "az.cmd",
+            )
+          : null,
+      ].filter((candidate): candidate is string => Boolean(candidate));
+      for (const candidate of candidates) {
+        if (await fs.stat(candidate).catch(() => null)) {
+          launcher = candidate;
+          break;
+        }
+      }
+    }
+    if (!launcher) {
       throw new Error("Azure CLI was not found on PATH.");
     }
-    const launcher = located.stdout.split(/\r?\n/).find(Boolean);
-    if (!launcher) throw new Error("Azure CLI launcher path was empty.");
-    const python = path.resolve(path.dirname(launcher.trim()), "..", "python.exe");
+    const python = path.resolve(path.dirname(launcher), "..", "python.exe");
     try {
       await fs.access(python);
     } catch {
@@ -164,6 +211,127 @@ async function ensureAzureDevOpsCli() {
   }
 }
 
+export function pullRequestNumbersFromCommitHistory(
+  commits: AzureCommit[],
+) {
+  const numbers: number[] = [];
+  const seen = new Set<number>();
+  for (const commit of commits) {
+    const match = commit.comment?.match(/\bMerged PR\s+(\d+)\b/i);
+    if (!match) continue;
+    const number = Number(match[1]);
+    if (!Number.isSafeInteger(number) || seen.has(number)) continue;
+    seen.add(number);
+    numbers.push(number);
+  }
+  return numbers;
+}
+
+async function pathHistoryPullRequestNumbers(
+  repository: RepositoryRecord,
+  filters: string[],
+) {
+  const repositoryDetails = await runAzJson<{
+    defaultBranch?: string | null;
+  }>([
+    "repos",
+    "show",
+    "--organization",
+    repository.organization_url!,
+    "--project",
+    repository.project_name!,
+    "--repository",
+    repository.repository_name,
+  ]);
+  const defaultBranch = repositoryDetails.defaultBranch?.replace(
+    /^refs\/heads\//,
+    "",
+  );
+  if (!defaultBranch) return [];
+
+  const orderedNumbers: number[] = [];
+  const seen = new Set<number>();
+  for (const filter of filters) {
+    const itemPath = `/${filter.replace(/^\/+/, "")}`;
+    const history = await runAzJson<{ value?: AzureCommit[] }>([
+      "devops",
+      "invoke",
+      "--area",
+      "git",
+      "--resource",
+      "commits",
+      "--route-parameters",
+      `project=${repository.project_name!}`,
+      `repositoryId=${repository.repository_name}`,
+      "--query-parameters",
+      `searchCriteria.itemPath=${itemPath}`,
+      `searchCriteria.itemVersion.version=${defaultBranch}`,
+      "searchCriteria.itemVersion.versionType=branch",
+      `searchCriteria.$top=${repository.scan_limit}`,
+      "searchCriteria.historyMode=firstParent",
+      "api-version=7.1",
+      "--organization",
+      repository.organization_url!,
+    ]);
+    for (const number of pullRequestNumbersFromCommitHistory(
+      history.value ?? [],
+    )) {
+      if (seen.has(number)) continue;
+      seen.add(number);
+      orderedNumbers.push(number);
+    }
+  }
+  return orderedNumbers;
+}
+
+async function listAzureScanCandidates(repository: RepositoryRecord) {
+  const candidates: AzurePullRequest[] = [];
+  const pageSize = Math.min(1_000, Math.max(100, repository.scan_limit));
+  let skip = 0;
+  while (candidates.length < repository.scan_limit) {
+    const page = await runAzJson<AzurePullRequest[]>([
+      "repos",
+      "pr",
+      "list",
+      "--organization",
+      repository.organization_url!,
+      "--project",
+      repository.project_name!,
+      "--repository",
+      repository.repository_name,
+      "--status",
+      "completed",
+      "--top",
+      String(pageSize),
+      "--skip",
+      String(skip),
+    ]);
+    if (page.length === 0) break;
+    candidates.push(
+      ...page.filter((pr) =>
+        prNumberMatchesRange(
+          pr.pullRequestId,
+          repository.pr_number_greater_than,
+          repository.pr_number_less_than,
+        ),
+      ),
+    );
+    getDb()
+      .prepare(`
+        UPDATE repositories
+        SET status_message = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'syncing'
+      `)
+      .run(
+        `Finding in-range PRs: ${Math.min(candidates.length, repository.scan_limit)}/${repository.scan_limit} candidates found after checking ${skip + page.length} recent PR records`,
+        repository.id,
+      );
+    if (page.length < pageSize) break;
+    skip += page.length;
+  }
+  return candidates.slice(0, repository.scan_limit);
+}
+
 async function ensureMirror(repository: RepositoryRecord) {
   const mirror = path.join(repositoryDatasetDir(repository.slug), "_repository");
   try {
@@ -194,14 +362,47 @@ function withMirrorOperationLock<T>(operation: () => Promise<T>) {
   return result;
 }
 
-async function prepareDiff(
-  mirror: string,
-  sourceCommit: string,
-  targetCommit: string,
-  changedFiles: string[],
+export class GitOperationError extends Error {
+  override name = "GitOperationError";
+}
+
+export async function retryGitOperation<T>(
+  operation: () => Promise<T>,
+  options: { maxRetries?: number; delayMs?: number } = {},
 ) {
-  return withMirrorOperationLock(async () => {
-    const fetch = await runCommand(
+  const maxRetries = options.maxRetries ?? 3;
+  const delayMs = options.delayMs ?? 1_000;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      throwIfWorkflowCancelled(error);
+      if (!(error instanceof GitOperationError) || attempt >= maxRetries) {
+        throw error;
+      }
+      if (delayMs > 0) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, delayMs * (attempt + 1)),
+        );
+      }
+    }
+  }
+}
+
+async function fetchMirrorCommit(mirror: string, commit: string) {
+  const available = await runCommand(
+    "git",
+    ["-C", mirror, "cat-file", "-e", `${commit}^{commit}`],
+    {
+      env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+      timeoutMs: 30_000,
+    },
+  );
+  if (available.exitCode === 0) return;
+
+  let lastError = `Unable to fetch commit ${commit}`;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    const result = await runCommand(
       "git",
       [
         "-C",
@@ -210,14 +411,48 @@ async function prepareDiff(
         "--quiet",
         "--no-tags",
         "--depth=1",
+        ...(attempt > 1 ? ["--refetch"] : []),
         "origin",
-        sourceCommit,
-        targetCommit,
+        commit,
       ],
       { timeoutMs: 15 * 60 * 1000 },
     );
-    if (fetch.exitCode !== 0) {
-      throw new Error(fetch.stderr.trim() || "Unable to fetch PR commits");
+    if (result.exitCode === 0) return;
+    lastError = result.stderr.trim() || lastError;
+    const retryable =
+      /TF401038|invalid data|bad pack|early EOF|remote end hung up|RPC failed|timed out|temporarily unavailable/i.test(
+        lastError,
+      );
+    if (!retryable || attempt === 4) break;
+    await new Promise((resolve) => setTimeout(resolve, attempt * 1_500));
+  }
+  throw new Error(lastError);
+}
+
+async function prepareDiff(
+  mirror: string,
+  sourceCommit: string,
+  targetCommit: string,
+  changedFiles: string[],
+) {
+  try {
+    return await withMirrorOperationLock(async () => {
+    try {
+      await fetchMirrorCommit(mirror, sourceCommit);
+      await fetchMirrorCommit(mirror, targetCommit);
+    } catch (error) {
+      throwIfWorkflowCancelled(error);
+      throw error;
+    }
+    const repairHead = await runCommand(
+      "git",
+      ["-C", mirror, "update-ref", "--no-deref", "HEAD", targetCommit],
+      { timeoutMs: 30_000 },
+    );
+    if (repairHead.exitCode !== 0) {
+      throw new Error(
+        repairHead.stderr.trim() || "Unable to repair the repository mirror HEAD",
+      );
     }
     const pathArgs = ["--", ...changedFiles];
     const names = await runCommand(
@@ -260,7 +495,14 @@ async function prepareDiff(
       throw new Error(diff.stderr.trim() || "Unable to generate PR diff");
     }
     return { files, diff: diff.stdout };
-  });
+    });
+  } catch (error) {
+    throwIfWorkflowCancelled(error);
+    throw new GitOperationError(
+      error instanceof Error ? error.message : String(error),
+      { cause: error },
+    );
+  }
 }
 
 async function getPullRequestIterations(
@@ -359,7 +601,10 @@ function sameIdentity(left: AzureIdentity, right: AzureIdentity) {
   );
 }
 
-export function isExplicitOwnerConfirmation(body: string) {
+export function isExplicitOwnerConfirmation(
+  body: string,
+  additionalWords: string[] = [],
+) {
   const normalized = body.trim();
   if (
     /\b(not an issue|by design|expected behavior|should be possible|already covered|no change needed|works as intended)\b/i.test(
@@ -376,8 +621,18 @@ export function isExplicitOwnerConfirmation(body: string) {
     /\bthank(?:s| you)\b.{0,40}\b(catch|finding|spotting|reporting)\b/i.test(
       normalized,
     ) ||
-    /\b(will fix|will address|fixed|addressed|corrected)\b/i.test(normalized)
+    /\b(will fix|will address|fixed|addressed|corrected)\b/i.test(normalized) ||
+    additionalWords.some((word) => {
+      const candidate = word.trim().toLocaleLowerCase();
+      return Boolean(candidate) &&
+        normalized.toLocaleLowerCase().includes(candidate);
+    })
   );
+}
+
+export function isEligibleResolvedThreadStatus(status: string | null) {
+  const normalized = status?.replace(/[\s_-]+/g, "").toLocaleLowerCase();
+  return normalized === "fixed" || normalized === "closed" || normalized === "resolved";
 }
 
 export function azureHumanFindings(
@@ -385,7 +640,13 @@ export function azureHumanFindings(
   threads: AzureThread[],
   filters: string[],
   iterations: AzurePullRequestIteration[] = [],
+  options: {
+    mode?: CollectionMode;
+    confirmationWords?: string[];
+  } = {},
 ): HumanFinding[] {
+  const mode = options.mode ?? "strict_confirmed";
+  const confirmationWords = options.confirmationWords ?? [];
   const findings: HumanFinding[] = [];
   for (const thread of threads) {
     const threadPath =
@@ -410,15 +671,24 @@ export function azureHumanFindings(
     );
     for (let index = 0; index < comments.length; index += 1) {
       const comment = comments[index];
-      if (
-        sameIdentity(comment.author, pr.createdBy) ||
-        !comments
+      const isConfirmed =
+        mode === "strict_confirmed" &&
+        comments
           .slice(index + 1)
           .some(
             (reply) =>
               sameIdentity(reply.author, pr.createdBy) &&
-              isExplicitOwnerConfirmation(reply.content ?? ""),
-          )
+              isExplicitOwnerConfirmation(
+                reply.content ?? "",
+                confirmationWords,
+              ),
+          );
+      const isResolved =
+        mode === "resolved_comments" &&
+        isEligibleResolvedThreadStatus(thread.status);
+      if (
+        sameIdentity(comment.author, pr.createdBy) ||
+        (!isConfirmed && !isResolved)
       ) {
         continue;
       }
@@ -473,7 +743,12 @@ export function azureHumanFindings(
         url: mapped.html_url,
         createdAt: comment.publishedDate,
         valueScore: value.score,
-        valueReasons: [...value.reasons, "pr-owner-confirmed"],
+        valueReasons: [
+          ...value.reasons,
+          mode === "strict_confirmed"
+            ? "pr-owner-confirmed"
+            : "resolved-thread",
+        ],
         scorePoint: 1,
         iterationId: iteration?.id ?? null,
         iterationSourceCommit:
@@ -522,6 +797,7 @@ function publicPr(
       sha: iteration?.sourceCommit ?? pr.lastMergeSourceCommit.commitId,
     },
     reviewIteration: iteration ?? null,
+    createdAt: pr.creationDate,
     mergedAt: pr.closedDate,
     updatedAt: pr.closedDate ?? pr.creationDate,
     additions: 0,
@@ -564,6 +840,12 @@ async function saveSnapshot(
         await getThreads(repository, pr.pullRequestId),
         filters,
         iterations,
+        {
+          mode: normalizeCollectionMode(repository.collection_mode),
+          confirmationWords: parseConfirmationWords(
+            repository.confirmation_words_json,
+          ),
+        },
       )
     : [];
   findings = findings.map((finding) => ({
@@ -780,9 +1062,7 @@ export async function collectAzurePullRequestBenchmarkSnapshot(
         WHERE repository_id = ? AND number = ? AND manual = 0
       `)
       .run(repository.id, number);
-    throw new Error(
-      "The PR has no owner-confirmed valued findings or reviewable changed files.",
-    );
+    return null;
   }
   return saved;
 }
@@ -790,15 +1070,23 @@ export async function collectAzurePullRequestBenchmarkSnapshot(
 export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
   await ensureAzureDevOpsCli();
   const db = getDb();
-  db.prepare(
-    "UPDATE repositories SET status = 'syncing', status_message = ?, scan_current = 0, scan_total = 0, collected_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+  const started = db.prepare(
+    "UPDATE repositories SET status = 'syncing', status_message = ?, scan_current = 0, scan_total = 0, scan_current_prs = NULL, collected_count = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'queued'",
   ).run("Loading recent Azure DevOps pull requests", repository.id);
+  if (started.changes === 0) throw new WorkflowCancellationError();
   const filters = parsePathFilters(repository.path_filter);
+  const creationCutoff = repository.pr_created_before ?? null;
+  const collectionMode = normalizeCollectionMode(repository.collection_mode);
+  const confirmationWords = parseConfirmationWords(
+    repository.confirmation_words_json,
+  );
+  const selectLevel = selectionLevelForMode(collectionMode);
   const scope = scanScope(repository, filters);
   const scanRunId = beginDatasetScan(repository, scope);
   const existing = db
     .prepare(`
-      SELECT id, number, dataset_path, defect_description, url
+      SELECT id, number, dataset_path, defect_description, url, select_level,
+        source_created_at
       FROM pull_requests
       WHERE repository_id = ? AND manual = 0 AND excluded_by_user = 0
     `)
@@ -814,20 +1102,29 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
         .all(repository.id) as Array<{ number: number }>
     ).map((row) => row.number),
   );
-  const preserved = await findReusablePullRequests(existing, filters);
-  const preserveExisting = db.transaction(() => {
-    db.prepare(
-      "UPDATE pull_requests SET active = 0 WHERE repository_id = ? AND manual = 0",
-    ).run(repository.id);
+  const preserved = await findReusablePullRequests(
+    existing,
+    filters,
+    selectLevel,
+    creationCutoff,
+  );
+  const reactivateExisting = db.transaction(() => {
     const reactivate = db.prepare(
       "UPDATE pull_requests SET active = 1 WHERE id = ?",
     );
     for (const pullRequest of preserved) reactivate.run(pullRequest.id);
   });
-  preserveExisting();
+  reactivateExisting();
   let savedCount = preserved.length;
   const preservedNumbers = new Set(
     preserved.map((pullRequest) => pullRequest.number),
+  );
+  const higherSelectionLevelNumbers = new Set(
+    existing
+      .filter(
+        (pullRequest) => (pullRequest.select_level ?? 0) > selectLevel,
+      )
+      .map((pullRequest) => pullRequest.number),
   );
   db.prepare(
     "UPDATE repositories SET status_message = ?, collected_count = ? WHERE id = ?",
@@ -840,48 +1137,64 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
   );
   const root = repositoryDatasetDir(repository.slug);
   await fs.mkdir(root, { recursive: true });
-  const prs = await runAzJson<AzurePullRequest[]>([
-    "repos",
-    "pr",
-    "list",
-    "--organization",
-    repository.organization_url!,
-    "--project",
-    repository.project_name!,
-    "--repository",
-    repository.repository_name,
-    "--status",
-    "completed",
-    "--top",
-    String(repository.scan_limit),
-  ]);
+  const prs = await listAzureScanCandidates(repository);
   prs.sort(
     (left, right) =>
       new Date(right.closedDate ?? 0).getTime() -
       new Date(left.closedDate ?? 0).getTime(),
   );
+  let pathHistoryCount = 0;
+  if (filters.length > 0) {
+    try {
+      const historyNumbers = await pathHistoryPullRequestNumbers(
+        repository,
+        filters,
+      );
+      const historySet = new Set(historyNumbers);
+      const prioritized = prs.filter((pr) =>
+        historySet.has(pr.pullRequestId),
+      );
+      if (prioritized.length > 0) {
+        pathHistoryCount = prioritized.length;
+        prs.splice(
+          0,
+          prs.length,
+          ...prioritized,
+          ...prs.filter((pr) => !historySet.has(pr.pullRequestId)),
+        );
+      }
+    } catch {
+      // The broad PR scan remains the completeness fallback.
+    }
+  }
   db.prepare(
     "UPDATE repositories SET status_message = ?, scan_total = ? WHERE id = ?",
   ).run(
-    "Preparing filtered repository mirror; the first run can take several minutes",
+    pathHistoryCount > 0
+      ? `Prioritized ${pathHistoryCount} PRs from fast folder history; preparing the repository mirror`
+      : "Preparing filtered repository mirror; the first run can take several minutes",
     prs.length,
     repository.id,
   );
   await ensureMirror(repository);
   let scanned = 0;
 
-  const scanConcurrency = 10;
+  const scanConcurrency = 3;
   for (
     let offset = 0;
     offset < prs.length && savedCount < repository.target_prs;
     offset += scanConcurrency
   ) {
     const batch = prs.slice(offset, offset + scanConcurrency);
+    const batchPrs = batch
+      .map((pr) => `#${pr.pullRequestId}`)
+      .join(", ");
     db.prepare(
-      "UPDATE repositories SET status_message = ?, scan_current = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      "UPDATE repositories SET status_message = ?, scan_current = ?, scan_current_prs = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     ).run(
       `${filters.length > 0 ? "Checking in-folder" : "Checking"} human comments in PRs ${offset + 1}-${offset + batch.length} with ${scanConcurrency} parallel workers`,
       scanned,
+      batchPrs,
       savedCount,
       repository.id,
     );
@@ -893,7 +1206,9 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
           sourceCommit: pr.lastMergeSourceCommit.commitId,
         };
         if (
+          !prCreatedOnOrBefore(pr.creationDate, creationCutoff) ||
           preservedNumbers.has(pr.pullRequestId) ||
+          higherSelectionLevelNumbers.has(pr.pullRequestId) ||
           excludedNumbers.has(pr.pullRequestId)
         ) {
           return null;
@@ -917,7 +1232,10 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
           getThreads(repository, pr.pullRequestId),
           getPullRequestIterations(repository, pr.pullRequestId),
         ]);
-        const findings = azureHumanFindings(pr, threads, filters, iterations);
+        const findings = azureHumanFindings(pr, threads, filters, iterations, {
+          mode: collectionMode,
+          confirmationWords,
+        });
         const findingCount = findings.filter(
           (finding) => finding.scorePoint === 1,
         ).length;
@@ -959,18 +1277,39 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
           repository.slug,
           candidate.pr.pullRequestId,
         );
-        const saved = await saveSnapshot(
-          repository,
-          candidate.pr,
-          destination,
-          true,
-          candidate.findings,
-        );
-        return { candidate, destination, saved };
+        try {
+          const saved = await retryGitOperation(() =>
+            saveSnapshot(
+              repository,
+              candidate.pr,
+              destination,
+              true,
+              candidate.findings,
+            ),
+          );
+          return { candidate, destination, saved, gitError: null };
+        } catch (error) {
+          if (!(error instanceof GitOperationError)) throw error;
+          return {
+            candidate,
+            destination,
+            saved: null,
+            gitError: error.message,
+          };
+        }
       }),
     );
 
-    for (const { candidate, destination, saved } of processedCandidates) {
+    for (const {
+      candidate,
+      destination,
+      saved,
+      gitError,
+    } of processedCandidates) {
+      if (gitError) {
+        recordScanFailure(scanRunId, candidate.scanCandidate);
+        continue;
+      }
       if (!saved) {
         recordScanOutcome(
           scanRunId,
@@ -985,12 +1324,22 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
       const findingCount = saved.findings.filter(
         (finding) => finding.scorePoint === 1,
       ).length;
+      if (findingCount === 0) {
+        recordScanOutcome(
+          scanRunId,
+          scope,
+          candidate.scanCandidate,
+          "ineligible",
+          0,
+        );
+        continue;
+      }
       db.prepare(`
       INSERT INTO pull_requests (
         repository_id, number, title, url, author, base_ref, head_ref,
-        merged_at, updated_at, additions, deletions, changed_files,
-        valued_comment_count, dataset_path, raw_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        merged_at, source_created_at, updated_at, additions, deletions, changed_files,
+        valued_comment_count, dataset_path, raw_json, select_level
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(repository_id, number) DO UPDATE SET
         title = excluded.title,
         url = excluded.url,
@@ -998,11 +1347,13 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
         base_ref = excluded.base_ref,
         head_ref = excluded.head_ref,
         merged_at = excluded.merged_at,
+        source_created_at = excluded.source_created_at,
         updated_at = excluded.updated_at,
         changed_files = excluded.changed_files,
         valued_comment_count = excluded.valued_comment_count,
         dataset_path = excluded.dataset_path,
         raw_json = excluded.raw_json,
+        select_level = MAX(pull_requests.select_level, excluded.select_level),
         active = CASE
           WHEN pull_requests.excluded_by_user = 1 THEN 0
           ELSE 1
@@ -1016,6 +1367,7 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
         metadata.base.ref,
         metadata.head.ref,
         metadata.mergedAt,
+        candidate.pr.creationDate,
         metadata.updatedAt,
         0,
         0,
@@ -1023,6 +1375,7 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
         findingCount,
         destination,
         JSON.stringify(metadata),
+        selectLevel,
       );
       recordScanOutcome(
         scanRunId,
@@ -1043,6 +1396,15 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
     WHERE repository_id = ? AND manual = 0 AND valued_comment_count = 0
   `).run(repository.id);
   completeDatasetScan(scanRunId, savedCount);
+  const scanSummary = db
+    .prepare(
+      "SELECT failed_count, failed_prs_json FROM dataset_scan_runs WHERE id = ?",
+    )
+    .get(scanRunId) as {
+      failed_count: number;
+      failed_prs_json: string;
+    };
+  const failedPrs = JSON.parse(scanSummary.failed_prs_json) as number[];
   await fs.writeFile(
     path.join(root, "manifest.json"),
     JSON.stringify(
@@ -1050,19 +1412,25 @@ export async function syncAzureRepositoryDataset(repository: RepositoryRecord) {
         repository: repository.slug,
         provider: "azure-devops",
         pathFilter: repository.path_filter,
+        collectionMode,
+        confirmationWords,
+        prNumberGreaterThan: repository.pr_number_greater_than,
+        prNumberLessThan: repository.pr_number_less_than,
+        prCreatedBefore: creationCutoff,
         generatedAt: new Date().toISOString(),
         scanRunId,
         scannedPullRequests: scanned,
         eligiblePullRequests: savedCount,
+        failedPullRequests: failedPrs,
       },
       null,
       2,
     ),
   );
   db.prepare(
-    "UPDATE repositories SET status = 'ready', status_message = ?, scan_current = ?, scan_total = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE repositories SET status = 'ready', status_message = ?, scan_current = ?, scan_total = ?, collected_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'syncing'",
   ).run(
-    `Collected ${savedCount} PRs after scanning ${scanned}${repository.path_filter ? ` under ${repository.path_filter}` : ""}`,
+    `Scanned ${scanned} PRs; collected ${savedCount}${scanSummary.failed_count > 0 ? `; Git failures ${scanSummary.failed_count}: ${failedPrs.map((number) => `#${number}`).join(", ")}` : ""}${repository.path_filter ? ` under ${repository.path_filter}` : ""}`,
     scanned,
     scanned,
     savedCount,

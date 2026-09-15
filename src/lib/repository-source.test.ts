@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   parseRepositorySource,
   pathMatchesFilters,
+  prCreatedOnOrBefore,
+  prNumberMatchesRange,
   reviewableChangedFilePaths,
 } from "@/lib/repository-source";
 
@@ -34,6 +36,27 @@ test("matches files under configured folder prefixes", () => {
     ]),
     false,
   );
+});
+
+test("applies strict optional PR number bounds", () => {
+  assert.equal(prNumberMatchesRange(200, null, null), true);
+  assert.equal(prNumberMatchesRange(200, 100, null), true);
+  assert.equal(prNumberMatchesRange(100, 100, null), false);
+  assert.equal(prNumberMatchesRange(200, null, 300), true);
+  assert.equal(prNumberMatchesRange(300, null, 300), false);
+  assert.equal(prNumberMatchesRange(200, 100, 300), true);
+});
+
+test("applies an inclusive PR creation-date cutoff", () => {
+  assert.equal(
+    prCreatedOnOrBefore("2026-09-01T23:59:59Z", "2026-09-01"),
+    true,
+  );
+  assert.equal(
+    prCreatedOnOrBefore("2026-09-02T00:00:00Z", "2026-09-01"),
+    false,
+  );
+  assert.equal(prCreatedOnOrBefore("2026-09-02T00:00:00Z", null), true);
 });
 
 test("requires an in-filter change but includes credited defect files outside it", () => {

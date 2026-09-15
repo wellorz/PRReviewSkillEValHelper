@@ -1,9 +1,12 @@
 "use client";
 
-import Link from "next/link";
 import { useParams } from "next/navigation";
 import { PageNavigation } from "@/app/page-navigation";
 import { PrTableControls } from "@/app/pr-table-controls";
+import {
+  parsePathFilters,
+  pathMatchesFilters,
+} from "@/lib/repository-source";
 import {
   FormEvent,
   useCallback,
@@ -29,6 +32,9 @@ type PullRequest = {
   url: string;
   author: string;
   changedFiles: number;
+  changedPaths: string[];
+  selectLevel: number;
+  manual: boolean;
   defects: Defect[];
 };
 
@@ -37,6 +43,7 @@ type PrSet = {
     id: number;
     displayName: string;
     slug: string;
+    pathFilter: string | null;
   };
   pullRequests: PullRequest[];
 };
@@ -54,8 +61,18 @@ export default function PrSetViewPage() {
   const [manualPr, setManualPr] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [prSearch, setPrSearch] = useState("");
+  const [prPathFilter, setPrPathFilter] = useState<string | null>(null);
+  const [prPathFilterEnabled, setPrPathFilterEnabled] = useState(true);
+  const [selectionMethod, setSelectionMethod] = useState<
+    "all" | "strict_confirmed" | "resolved_comments" | "manual"
+  >("all");
   const [pageSizeInput, setPageSizeInput] = useState("20");
   const [currentPage, setCurrentPage] = useState(1);
+  const pathFilterStorageKey = `repository-${id}-pr-set-path-filter`;
+  const pathFilterEnabledStorageKey =
+    `repository-${id}-pr-set-path-filter-enabled`;
+  const selectionMethodStorageKey =
+    `repository-${id}-pr-set-selection-method`;
 
   const load = useCallback(async () => {
     try {
@@ -81,6 +98,30 @@ export default function PrSetViewPage() {
       window.clearInterval(interval);
     };
   }, [load]);
+
+  useEffect(() => {
+    const initialize = window.setTimeout(() => {
+      setPrPathFilter(window.localStorage.getItem(pathFilterStorageKey));
+      setPrPathFilterEnabled(
+        window.localStorage.getItem(pathFilterEnabledStorageKey) !== "false",
+      );
+      const storedSelectionMethod = window.localStorage.getItem(
+        selectionMethodStorageKey,
+      );
+      if (
+        storedSelectionMethod === "strict_confirmed" ||
+        storedSelectionMethod === "resolved_comments" ||
+        storedSelectionMethod === "manual"
+      ) {
+        setSelectionMethod(storedSelectionMethod);
+      }
+    }, 0);
+    return () => window.clearTimeout(initialize);
+  }, [
+    pathFilterEnabledStorageKey,
+    pathFilterStorageKey,
+    selectionMethodStorageKey,
+  ]);
 
   useEffect(() => {
     if (!defectModal) return;
@@ -193,14 +234,36 @@ export default function PrSetViewPage() {
     500,
     Math.max(1, Number.parseInt(pageSizeInput, 10) || 20),
   );
+  const effectivePathFilter = prPathFilter ?? data?.repository.pathFilter ?? "";
   const filteredPullRequests = useMemo(() => {
     const query = prSearch.trim().replace(/^#/, "");
+    const pathFilters = prPathFilterEnabled
+      ? parsePathFilters(effectivePathFilter)
+      : [];
     const pullRequests = data?.pullRequests ?? [];
-    if (!query) return pullRequests;
-    return pullRequests.filter((pr) =>
-      String(pr.number).includes(query),
+    return pullRequests.filter(
+      (pr) =>
+        (!query || String(pr.number).includes(query)) &&
+        (pathFilters.length === 0 ||
+          pr.changedPaths.some((filePath) =>
+            pathMatchesFilters(filePath, pathFilters),
+          )) &&
+        (selectionMethod === "all" ||
+          (selectionMethod === "manual" && pr.manual) ||
+          (selectionMethod === "strict_confirmed" &&
+            !pr.manual &&
+            pr.selectLevel === 1) ||
+          (selectionMethod === "resolved_comments" &&
+            !pr.manual &&
+            pr.selectLevel === 0)),
     );
-  }, [data, prSearch]);
+  }, [
+    data,
+    effectivePathFilter,
+    prPathFilterEnabled,
+    prSearch,
+    selectionMethod,
+  ]);
   const pageCount = Math.max(
     1,
     Math.ceil(filteredPullRequests.length / pageSize),
@@ -277,6 +340,27 @@ export default function PrSetViewPage() {
           search={prSearch}
           onSearchChange={(value) => {
             setPrSearch(value);
+            setCurrentPage(1);
+          }}
+          pathFilter={effectivePathFilter}
+          onPathFilterChange={(value) => {
+            setPrPathFilter(value);
+            window.localStorage.setItem(pathFilterStorageKey, value);
+            setCurrentPage(1);
+          }}
+          pathFilterEnabled={prPathFilterEnabled}
+          onPathFilterEnabledChange={(value) => {
+            setPrPathFilterEnabled(value);
+            window.localStorage.setItem(
+              pathFilterEnabledStorageKey,
+              String(value),
+            );
+            setCurrentPage(1);
+          }}
+          selectionMethod={selectionMethod}
+          onSelectionMethodChange={(value) => {
+            setSelectionMethod(value);
+            window.localStorage.setItem(selectionMethodStorageKey, value);
             setCurrentPage(1);
           }}
           pageSize={pageSizeInput}
@@ -361,7 +445,9 @@ export default function PrSetViewPage() {
                               >
                                 {defect.manual
                                   ? "Manual"
-                                  : "Owner confirmed"}
+                                    : pr.selectLevel === 1
+                                      ? "Strictly confirmed"
+                                      : "Resolved comment"}
                               </span>
                               <strong>{defect.body}</strong>
                             </div>
@@ -388,7 +474,7 @@ export default function PrSetViewPage() {
                   <td colSpan={2} className="tableEmpty">
                     {data.pullRequests.length === 0
                       ? "No PRs have been collected for this repository."
-                      : `No PR number matches "${prSearch.trim()}".`}
+                      : "No PRs match the current filters."}
                   </td>
                 </tr>
               )}
@@ -464,7 +550,11 @@ export default function PrSetViewPage() {
                             : "defectSource"
                         }
                       >
-                        {defect.manual ? "Manual" : "Owner confirmed"}
+                      {defect.manual
+                        ? "Manual"
+                        : modalPr.selectLevel === 1
+                          ? "Strictly confirmed"
+                          : "Resolved comment"}
                       </span>
                     </div>
                     {defectModal.mode === "edit" ? (

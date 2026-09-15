@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { personalSkillResultConfiguration } from "@/lib/personal-skill-execution";
 
 export function queuePersonalSkillResults(
   db: Database.Database,
@@ -25,20 +26,48 @@ export function queuePersonalSkillResults(
       usage_json = NULL,
       metrics_json = NULL,
       raw_output_json = NULL,
+      skill_snapshot_path = NULL,
       repository_commit = NULL,
       error = NULL,
       report_path = NULL,
       completed_at = NULL,
       updated_at = CURRENT_TIMESTAMP
   `);
+  const clearAnalysis = db.prepare(`
+    DELETE FROM skill_analysis_results
+    WHERE skill_id = ? AND pull_request_id = ?
+      AND model = ? AND model_secondary = ? AND context_tier = ?
+  `);
+  const executionMode = db.prepare(`
+    SELECT execution_mode
+    FROM personal_review_skills
+    WHERE id = ?
+  `);
   for (const skillId of options.skillIds) {
+    const skill = executionMode.get(skillId) as
+      | { execution_mode: string }
+      | undefined;
+    if (!skill) {
+      throw new Error(`Personal skill ${skillId} does not exist`);
+    }
+    const configuration = personalSkillResultConfiguration(
+      skill.execution_mode,
+      options,
+    );
     for (const pullRequestId of options.pullRequestIds) {
+      clearAnalysis.run(
+        skillId,
+        pullRequestId,
+        configuration.model,
+        configuration.modelSecondary,
+        configuration.contextTier,
+      );
       queue.run(
         skillId,
         pullRequestId,
-        options.model,
-        options.modelSecondary,
-        options.contextTier,
+        configuration.model,
+        configuration.modelSecondary,
+        configuration.contextTier,
       );
     }
   }

@@ -19,6 +19,30 @@ export type ComparisonMatrixRow = {
   href?: string;
 };
 
+export type ComparisonScoreSortDirection = "asc" | "desc";
+
+export function sortComparisonRowsByScore(
+  rows: ComparisonMatrixRow[],
+  direction: ComparisonScoreSortDirection | null,
+) {
+  if (!direction) return rows;
+  const multiplier = direction === "asc" ? 1 : -1;
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((left, right) => {
+      const leftScore = left.row.summary?.percentage;
+      const rightScore = right.row.summary?.percentage;
+      if (leftScore == null && rightScore == null) {
+        return left.index - right.index;
+      }
+      if (leftScore == null) return 1;
+      if (rightScore == null) return -1;
+      const difference = (leftScore - rightScore) * multiplier;
+      return difference || left.index - right.index;
+    })
+    .map(({ row }) => row);
+}
+
 export function summarizeComparisonResults(
   results: Array<{ status: string; earnedPoints: number }>,
   totalPullRequests: number,

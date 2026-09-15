@@ -40,6 +40,8 @@ export type ModelFinding = {
   agreedBy?: string[];
   sourceModels?: string[];
   contextTier?: string | null;
+  adjudicatedHumanFindingIds?: string[];
+  rejectedHumanFindingIds?: string[];
 };
 
 export type ReviewSnapshotManifestEntry = {
@@ -73,9 +75,62 @@ export type SkillMitigationEdit = {
 
 export type SkillAnalysisOutput = {
   summary: string;
+  commentAssessmentStatus: "supported" | "unsupported" | "ambiguous";
+  initialCommentAssessmentStatus?: "supported" | "unsupported" | "ambiguous";
+  knowledgeRecheckPerformed?: boolean;
+  knowledgeGraphSummary?: string;
+  knowledgeGraphFiles?: string[];
+  changeAndCommentAssessment: string;
+  assessmentEvidence: string[];
+  escalation: string;
+  reviewAspect: string;
+  prevention: string;
+  skillGap: string;
   whyMissed: string;
   mitigation: string;
   edits: SkillMitigationEdit[];
+};
+
+export type CodeReadingKnowledgeSymbol = {
+  name: string;
+  kind: "function" | "class" | "structure" | "method" | "module" | "other";
+  sourcePath: string;
+  purpose: string;
+  usages: string[];
+  similarSymbols: Array<{
+    name: string;
+    sourcePath: string;
+    similarities: string;
+    differences: string;
+  }>;
+  inputs: Array<{
+    name: string;
+    type: string;
+    validValues: string;
+    invalidBehavior: string;
+  }>;
+  outputs: Array<{
+    name: string;
+    type: string;
+    expectedValues: string;
+    meaning: string;
+  }>;
+  errorBehavior: string[];
+  dependencies: Array<{
+    name: string;
+    kind: string;
+    relationship: string;
+  }>;
+  callFlow: string[];
+  invariants: string[];
+  evidence: string[];
+  uncertainties: string[];
+};
+
+export type CodeReadingKnowledgeOutput = {
+  summary: string;
+  gapType: string;
+  symbols: CodeReadingKnowledgeSymbol[];
 };
 
 export type Match = {
@@ -126,6 +181,7 @@ export type GithubPullRequest = {
   head: { ref: string; sha: string };
   merged_at: string | null;
   closed_at: string | null;
+  created_at: string;
   updated_at: string;
   additions?: number;
   deletions?: number;
@@ -143,18 +199,25 @@ export type RepositoryRecord = {
   project_name: string | null;
   repository_name: string;
   path_filter: string | null;
+  collection_mode?: "strict_confirmed" | "resolved_comments";
+  confirmation_words_json?: string;
   skill_path: string;
   model: string;
   model_secondary: string;
   context_tier: string;
   target_prs: number;
   scan_limit: number;
+  pr_number_greater_than: number | null;
+  pr_number_less_than: number | null;
+  pr_created_before?: string | null;
   status: string;
   status_message: string | null;
   scan_current: number;
   scan_total: number;
+  scan_current_prs: string | null;
   collected_count: number;
   baseline_concurrency: number;
+  build_knowledge_graph: number;
   local_repo_path: string | null;
   local_repo_branch: string | null;
   local_repo_warning: string | null;
@@ -167,6 +230,8 @@ export type PersonalReviewSkillRecord = {
   repository_id: number;
   name: string;
   path: string;
+  trigger_instruction: string;
+  execution_mode: "copilot-skill" | "devloop-local";
   active: number;
   created_at: string;
   updated_at: string;

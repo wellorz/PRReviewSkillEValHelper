@@ -3,16 +3,28 @@ import { syncRepositoryDataset } from "../src/lib/github";
 import { executeEvaluationRun } from "../src/lib/pipeline";
 import { executeQuickReview } from "../src/lib/quick-review";
 import { executeSkillAnalysisJob } from "../src/lib/skill-analysis";
+import {
+  executeSkillTrainingJob,
+  type SkillTrainingJob,
+} from "../src/lib/skill-training";
 import { executeWorkflowTask } from "../src/lib/workflow";
 import {
   hasCurrentWorkflowWorkerVersion,
   markWorkflowWorkerVersion,
 } from "../src/lib/workflow-version";
-import { repositorySyncQueueMessage } from "../src/lib/repository-queue";
 import {
+  cancelActiveDatasetScans,
   failActiveDatasetScans,
   interruptActiveDatasetScans,
 } from "../src/lib/scan-ledger";
+import {
+  runWithWorkflowCancellation,
+  WorkflowCancellationError,
+} from "../src/lib/workflow-cancellation";
+import {
+  canStartWorkflowTask,
+  workflowTaskSlots,
+} from "../src/lib/workflow-task-concurrency";
 import type { RepositoryRecord, RunRecord } from "../src/lib/types";
 
 const db = getDb();
@@ -24,6 +36,8 @@ type WorkflowTask = {
   kind: "manual_pr" | "baseline" | "skill_eval";
   pr_ids_json: string;
   payload_json: string | null;
+  total_items: number;
+  baseline_concurrency: number;
 };
 type AnalysisJob = {
   id: number;
@@ -37,18 +51,28 @@ type AnalysisJob = {
 };
 const runningWorkflowTasks = new Map<
   number,
-  { kind: WorkflowTask["kind"]; promise: Promise<void> }
+  {
+    kind: WorkflowTask["kind"];
+    repositoryId: number;
+    slots: number;
+    promise: Promise<void>;
+  }
 >();
 const runningAnalysisJobs = new Map<
   number,
   { mode: AnalysisJob["mode"]; promise: Promise<void> }
 >();
+const runningRepositorySyncs = new Map<number, Promise<void>>();
+const runningTrainingJobs = new Map<number, Promise<void>>();
 
 markWorkflowWorkerVersion();
 interruptActiveDatasetScans();
 
 db.prepare(
   "UPDATE repositories SET status = 'queued', status_message = 'Recovered interrupted dataset sync' WHERE status = 'syncing'",
+).run();
+db.prepare(
+  "UPDATE repositories SET status = 'cancelled', status_message = 'Collection cancelled' WHERE status = 'cancelling'",
 ).run();
 db.prepare(
   "UPDATE runs SET status = 'queued', error = NULL WHERE status = 'running'",
@@ -64,6 +88,9 @@ db.prepare(
 ).run();
 db.prepare(
   "UPDATE skill_analysis_results SET status = 'pending', error = NULL WHERE status = 'running'",
+).run();
+db.prepare(
+  "UPDATE skill_training_jobs SET status = 'queued', status_message = 'Recovered interrupted training', error = NULL WHERE status = 'running'",
 ).run();
 
 function errorDetails(error: unknown) {
@@ -87,6 +114,53 @@ function failRepository(id: number, error: unknown) {
   db.prepare(
     "UPDATE repositories SET status = 'failed', status_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
   ).run(message, id);
+}
+
+async function executeRepositorySync(repository: RepositoryRecord) {
+  const controller = new AbortController();
+  const cancellationTimer = setInterval(() => {
+    const current = db
+      .prepare("SELECT status FROM repositories WHERE id = ?")
+      .get(repository.id) as { status: string } | undefined;
+    if (
+      current?.status === "cancelling" ||
+      current?.status === "cancelled"
+    ) {
+      controller.abort();
+    }
+  }, 500);
+  try {
+    await runWithWorkflowCancellation(controller.signal, () =>
+      syncRepositoryDataset(repository),
+    );
+    const current = db
+      .prepare("SELECT status FROM repositories WHERE id = ?")
+      .get(repository.id) as { status: string } | undefined;
+    if (
+      controller.signal.aborted ||
+      current?.status === "cancelling" ||
+      current?.status === "cancelled"
+    ) {
+      throw new WorkflowCancellationError();
+    }
+  } catch (error) {
+    if (
+      error instanceof WorkflowCancellationError ||
+      controller.signal.aborted
+    ) {
+      cancelActiveDatasetScans(repository.id);
+      db.prepare(`
+        UPDATE repositories
+        SET status = 'cancelled', status_message = 'Collection cancelled',
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(repository.id);
+      return;
+    }
+    throw error;
+  } finally {
+    clearInterval(cancellationTimer);
+  }
 }
 
 function failRun(id: number, error: unknown) {
@@ -121,6 +195,32 @@ function failSkillAnalysisJob(id: number, error: unknown) {
       status = 'failed', status_message = 'Failed', error = ?, completed_at = ?
     WHERE id = ?
   `).run(message, new Date().toISOString(), id);
+}
+
+function failSkillTrainingJob(id: number, error: unknown) {
+  const message = errorDetails(error);
+  console.error(`Skill training job ${id} failed:\n${message}`);
+  const completedAt = new Date().toISOString();
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE skill_training_jobs SET
+        status = 'failed', status_message = 'Training failed', error = ?,
+        completed_at = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(message, completedAt, id);
+    db.prepare(`
+      UPDATE workflow_tasks SET
+        status = 'failed', status_message = 'Training failed', error = ?,
+        completed_at = ?
+      WHERE training_job_id = ? AND status IN ('queued', 'running')
+    `).run(message, completedAt, id);
+    db.prepare(`
+      UPDATE skill_analysis_jobs SET
+        status = 'failed', status_message = 'Training failed', error = ?,
+        completed_at = ?
+      WHERE training_job_id = ? AND status IN ('queued', 'running')
+    `).run(message, completedAt, id);
+  })();
 }
 
 function enqueueDueSchedules() {
@@ -176,13 +276,66 @@ async function tick() {
 
   enqueueDueSchedules();
 
-  if (runningAnalysisJobs.size < MAX_CONCURRENT_ANALYSIS_JOBS) {
+  if (
+    runningTrainingJobs.size === 0 &&
+    runningAnalysisJobs.size === 0
+  ) {
+    const trainingJob = db
+      .prepare(`
+        SELECT id, repository_id, skill_id, status, pr_ids_json,
+          current_pr_ids_json, current_iteration, max_iterations,
+          current_item, total_items, status_message, history_json
+        FROM skill_training_jobs training
+        WHERE training.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_tasks task
+            WHERE task.repository_id = training.repository_id
+              AND task.training_job_id IS NULL
+              AND task.status IN ('queued', 'running')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM skill_analysis_jobs analysis
+            WHERE analysis.repository_id = training.repository_id
+              AND analysis.training_job_id IS NULL
+              AND analysis.status IN ('queued', 'running')
+          )
+        ORDER BY training.id ASC
+        LIMIT 1
+      `)
+      .get() as SkillTrainingJob | undefined;
+    if (
+      trainingJob &&
+      db
+        .prepare(
+          "UPDATE skill_training_jobs SET status = 'running' WHERE id = ? AND status = 'queued'",
+        )
+        .run(trainingJob.id).changes === 1
+    ) {
+      const promise = executeSkillTrainingJob(trainingJob)
+        .catch((error) => failSkillTrainingJob(trainingJob.id, error))
+        .finally(() => {
+          runningTrainingJobs.delete(trainingJob.id);
+        });
+      runningTrainingJobs.set(trainingJob.id, promise);
+    }
+  }
+
+  if (
+    runningTrainingJobs.size === 0 &&
+    runningAnalysisJobs.size < MAX_CONCURRENT_ANALYSIS_JOBS
+  ) {
     const analysisJobs = db
       .prepare(`
         SELECT id, repository_id, skill_id, mode, model, model_secondary,
           context_tier, pr_ids_json
         FROM skill_analysis_jobs job
         WHERE status = 'queued'
+          AND training_job_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM skill_training_jobs training
+            WHERE training.repository_id = job.repository_id
+              AND training.status IN ('queued', 'running')
+          )
           AND (
             mode = 'analyze'
             OR NOT EXISTS (
@@ -230,39 +383,65 @@ async function tick() {
     }
   }
 
-  const activeKinds = new Set(
-    [...runningWorkflowTasks.values()].map((task) => task.kind),
+  const manualTaskActive = [...runningWorkflowTasks.values()].some(
+    (task) => task.kind === "manual_pr",
   );
-  const manualTaskActive = activeKinds.has("manual_pr");
   if (!manualTaskActive) {
     const queuedTasks = db
       .prepare(`
-        SELECT id, repository_id, kind, pr_ids_json, payload_json
-        FROM workflow_tasks
-        WHERE status = 'queued'
+        SELECT task.id, task.repository_id, task.kind, task.pr_ids_json,
+          task.payload_json, task.total_items, repository.baseline_concurrency
+        FROM workflow_tasks task
+        JOIN repositories repository ON repository.id = task.repository_id
+        WHERE task.status = 'queued'
+          AND task.training_job_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM skill_training_jobs training
+            WHERE training.repository_id = task.repository_id
+              AND training.status IN ('queued', 'running')
+          )
         ORDER BY
-          CASE kind
+          CASE task.kind
             WHEN 'manual_pr' THEN 0
             WHEN 'skill_eval' THEN 1
             ELSE 2
           END,
-          id ASC
+          task.id ASC
         LIMIT 20
       `)
       .all() as WorkflowTask[];
     for (const workflowTask of queuedTasks) {
-      if (workflowTask.kind === "manual_pr") {
-        if (runningWorkflowTasks.size > 0) continue;
-      } else {
-        if (activeKinds.has(workflowTask.kind)) continue;
-        if (
-          workflowTask.kind === "skill_eval" &&
-          [...runningAnalysisJobs.values()].some(
-            (job) => job.mode === "analyze_apply",
-          )
-        ) {
-          continue;
-        }
+      if (
+        workflowTask.kind === "skill_eval" &&
+        runningTrainingJobs.size > 0
+      ) {
+        continue;
+      }
+      if (
+        workflowTask.kind === "skill_eval" &&
+        [...runningAnalysisJobs.values()].some(
+          (job) => job.mode === "analyze_apply",
+        )
+      ) {
+        continue;
+      }
+      if (
+        !canStartWorkflowTask(
+          {
+            kind: workflowTask.kind,
+            repositoryId: workflowTask.repository_id,
+            totalItems: workflowTask.total_items,
+            payloadJson: workflowTask.payload_json,
+          },
+          [...runningWorkflowTasks.values()].map((task) => ({
+            kind: task.kind,
+            repositoryId: task.repositoryId,
+            slots: task.slots,
+          })),
+          workflowTask.baseline_concurrency,
+        )
+      ) {
+        continue;
       }
       const claimed = db
         .prepare(
@@ -277,40 +456,34 @@ async function tick() {
         });
       runningWorkflowTasks.set(workflowTask.id, {
         kind: workflowTask.kind,
+        repositoryId: workflowTask.repository_id,
+        slots: workflowTaskSlots({
+          kind: workflowTask.kind,
+          repositoryId: workflowTask.repository_id,
+          totalItems: workflowTask.total_items,
+          payloadJson: workflowTask.payload_json,
+        }),
         promise,
       });
-      activeKinds.add(workflowTask.kind);
       if (workflowTask.kind === "manual_pr") break;
     }
   }
 
-  if (runningWorkflowTasks.size > 0 || runningAnalysisJobs.size > 0) {
-    const queuedRepositories = db
-      .prepare("SELECT id FROM repositories WHERE status = 'queued'")
-      .all() as Array<{ id: number }>;
-    const updateMessage = db.prepare(
-      "UPDATE repositories SET status_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    );
-    for (const queuedRepository of queuedRepositories) {
-      updateMessage.run(
-        repositorySyncQueueMessage(queuedRepository.id),
-        queuedRepository.id,
-      );
-    }
-    return;
-  }
-
-  const repository = db
-    .prepare(
-      "SELECT * FROM repositories WHERE status = 'queued' ORDER BY updated_at DESC, id DESC LIMIT 1",
-    )
-    .get() as RepositoryRecord | undefined;
+  const repository =
+    runningRepositorySyncs.size === 0
+      ? (db
+          .prepare(
+            "SELECT * FROM repositories WHERE status = 'queued' ORDER BY updated_at DESC, id DESC LIMIT 1",
+          )
+          .get() as RepositoryRecord | undefined)
+      : undefined;
   if (repository) {
-    try {
-      await syncRepositoryDataset(repository);
-    } catch (error) {
-      failRepository(repository.id, error);
-    }
+    const promise = executeRepositorySync(repository)
+      .catch((error) => failRepository(repository.id, error))
+      .finally(() => {
+        runningRepositorySyncs.delete(repository.id);
+      });
+    runningRepositorySyncs.set(repository.id, promise);
     return;
   }
 
@@ -353,6 +526,8 @@ async function main() {
   await Promise.all([
     ...[...runningWorkflowTasks.values()].map((task) => task.promise),
     ...[...runningAnalysisJobs.values()].map((job) => job.promise),
+    ...runningTrainingJobs.values(),
+    ...runningRepositorySyncs.values(),
   ]);
   console.log("PR review benchmark worker stopped.");
 }

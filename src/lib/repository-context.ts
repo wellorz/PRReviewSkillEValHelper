@@ -103,8 +103,13 @@ async function removeWorktree(repositoryPath: string, worktreePath: string) {
   }
   if (
     remove.exitCode !== 0 &&
-    /is not a working tree|is not a working tree directory/i.test(
-      remove.stderr,
+    (
+      /is not a working tree|is not a working tree directory/i.test(
+        remove.stderr,
+      ) ||
+      /validation failed, cannot remove working tree: .*[/\\]\.git.*does not exist/i.test(
+        remove.stderr,
+      )
     )
   ) {
     await fs.rm(worktreePath, { recursive: true, force: true });

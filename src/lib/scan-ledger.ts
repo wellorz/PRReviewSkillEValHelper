@@ -1,7 +1,8 @@
 import { getDb } from "@/lib/db";
+import { collectionPolicyKey } from "@/lib/collection-policy";
 import type { RepositoryRecord } from "@/lib/types";
 
-export const GROUND_TRUTH_POLICY_VERSION = "owner-confirmed-iteration-v6";
+export const GROUND_TRUTH_POLICY_VERSION = "comment-selection-v7";
 
 export type ScanScope = {
   repositoryId: number;
@@ -39,7 +40,7 @@ export function scanScope(
     repositoryId: repository.id,
     provider: repository.provider,
     pathFilterKey: normalizedPathFilterKey(filters),
-    policyVersion: GROUND_TRUTH_POLICY_VERSION,
+    policyVersion: `${GROUND_TRUTH_POLICY_VERSION}-${collectionPolicyKey(repository)}`,
   };
 }
 
@@ -198,6 +199,28 @@ export function recordScanOutcome(
   })();
 }
 
+export function recordScanFailure(
+  runId: number,
+  candidate: ScanCandidate,
+) {
+  const db = getDb();
+  db.transaction(() => {
+    updateRunRange(runId, candidate, "scanned_count");
+    const row = db
+      .prepare("SELECT failed_prs_json FROM dataset_scan_runs WHERE id = ?")
+      .get(runId) as { failed_prs_json: string } | undefined;
+    const failedPrs = row
+      ? JSON.parse(row.failed_prs_json) as number[]
+      : [];
+    if (!failedPrs.includes(candidate.number)) failedPrs.push(candidate.number);
+    db.prepare(`
+      UPDATE dataset_scan_runs
+      SET failed_count = ?, failed_prs_json = ?
+      WHERE id = ?
+    `).run(failedPrs.length, JSON.stringify(failedPrs), runId);
+  })();
+}
+
 export function completeDatasetScan(runId: number, eligibleCount: number) {
   getDb()
     .prepare(`
@@ -219,6 +242,16 @@ export function failActiveDatasetScans(
       WHERE repository_id = ? AND status = 'running'
     `)
     .run(error, new Date().toISOString(), repositoryId);
+}
+
+export function cancelActiveDatasetScans(repositoryId: number) {
+  getDb()
+    .prepare(`
+      UPDATE dataset_scan_runs
+      SET status = 'cancelled', error = NULL, completed_at = ?
+      WHERE repository_id = ? AND status = 'running'
+    `)
+    .run(new Date().toISOString(), repositoryId);
 }
 
 export function interruptActiveDatasetScans() {

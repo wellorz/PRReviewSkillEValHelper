@@ -52,7 +52,8 @@ async function readFindings(datasetPath: string) {
   findings = restoreLegacyCappedCredits(findings);
   findings = findings.map((finding) =>
     finding.id.startsWith("azure-thread-") &&
-    !finding.valueReasons.includes("pr-owner-confirmed")
+    !finding.valueReasons.includes("pr-owner-confirmed") &&
+    !finding.valueReasons.includes("resolved-thread")
       ? { ...finding, scorePoint: 0 }
       : finding,
   );

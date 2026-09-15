@@ -20,18 +20,25 @@ db.exec(`
     project_name TEXT,
     repository_name TEXT NOT NULL DEFAULT '',
     path_filter TEXT,
+    collection_mode TEXT NOT NULL DEFAULT 'strict_confirmed',
+    confirmation_words_json TEXT NOT NULL DEFAULT '[]',
     skill_path TEXT NOT NULL,
     model TEXT NOT NULL,
     model_secondary TEXT NOT NULL DEFAULT 'gpt-5.4',
     context_tier TEXT NOT NULL DEFAULT 'default',
     target_prs INTEGER NOT NULL DEFAULT 100,
     scan_limit INTEGER NOT NULL DEFAULT 500,
+    pr_number_greater_than INTEGER,
+    pr_number_less_than INTEGER,
+    pr_created_before TEXT,
     status TEXT NOT NULL DEFAULT 'queued',
     status_message TEXT,
     scan_current INTEGER NOT NULL DEFAULT 0,
     scan_total INTEGER NOT NULL DEFAULT 0,
+    scan_current_prs TEXT,
     collected_count INTEGER NOT NULL DEFAULT 0,
     baseline_concurrency INTEGER NOT NULL DEFAULT 5,
+    build_knowledge_graph INTEGER NOT NULL DEFAULT 0,
     local_repo_path TEXT,
     local_repo_branch TEXT,
     local_repo_warning TEXT,
@@ -49,6 +56,7 @@ db.exec(`
     base_ref TEXT NOT NULL,
     head_ref TEXT NOT NULL,
     merged_at TEXT,
+    source_created_at TEXT,
     updated_at TEXT NOT NULL,
     additions INTEGER NOT NULL DEFAULT 0,
     deletions INTEGER NOT NULL DEFAULT 0,
@@ -56,6 +64,7 @@ db.exec(`
     valued_comment_count INTEGER NOT NULL,
     dataset_path TEXT NOT NULL,
     raw_json TEXT NOT NULL,
+    select_level INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     selected INTEGER NOT NULL DEFAULT 1,
     manual INTEGER NOT NULL DEFAULT 0,
@@ -158,6 +167,8 @@ db.exec(`
     status_message TEXT NOT NULL DEFAULT 'Waiting for worker',
     error TEXT,
     report_path TEXT,
+    training_job_id INTEGER,
+    training_iteration INTEGER,
     started_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -174,6 +185,9 @@ db.exec(`
     repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     path TEXT NOT NULL,
+    trigger_instruction TEXT NOT NULL DEFAULT '',
+    execution_mode TEXT NOT NULL DEFAULT 'copilot-skill'
+      CHECK(execution_mode IN ('copilot-skill', 'devloop-local')),
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -226,6 +240,7 @@ db.exec(`
     usage_json TEXT,
     metrics_json TEXT,
     raw_output_json TEXT,
+    skill_snapshot_path TEXT,
     repository_context_mode TEXT NOT NULL DEFAULT 'diff',
     repository_commit TEXT,
     error TEXT,
@@ -276,6 +291,8 @@ db.exec(`
     total_items INTEGER NOT NULL DEFAULT 0,
     status_message TEXT NOT NULL DEFAULT 'Waiting for worker',
     error TEXT,
+    training_job_id INTEGER,
+    training_iteration INTEGER,
     started_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -309,6 +326,29 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_skill_analysis_results_pr
     ON skill_analysis_results(pull_request_id, skill_id);
 
+  CREATE TABLE IF NOT EXISTS skill_training_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    skill_id INTEGER NOT NULL REFERENCES personal_review_skills(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'queued',
+    pr_ids_json TEXT NOT NULL,
+    current_pr_ids_json TEXT NOT NULL,
+    current_iteration INTEGER NOT NULL DEFAULT 0,
+    max_iterations INTEGER NOT NULL DEFAULT 5,
+    current_item INTEGER NOT NULL DEFAULT 0,
+    total_items INTEGER NOT NULL DEFAULT 0,
+    status_message TEXT NOT NULL DEFAULT 'Waiting for worker',
+    history_json TEXT NOT NULL DEFAULT '[]',
+    error TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_skill_training_jobs_status
+    ON skill_training_jobs(status, id);
+
   CREATE TABLE IF NOT EXISTS dataset_scan_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
@@ -321,6 +361,8 @@ db.exec(`
     scanned_count INTEGER NOT NULL DEFAULT 0,
     skipped_count INTEGER NOT NULL DEFAULT 0,
     eligible_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    failed_prs_json TEXT NOT NULL DEFAULT '[]',
     newest_pr_number INTEGER,
     oldest_pr_number INTEGER,
     newest_source_date TEXT,
@@ -367,6 +409,8 @@ for (const [name, definition] of [
   ["manual", "INTEGER NOT NULL DEFAULT 0"],
   ["excluded_by_user", "INTEGER NOT NULL DEFAULT 0"],
   ["defect_description", "TEXT"],
+  ["source_created_at", "TEXT"],
+  ["select_level", "INTEGER NOT NULL DEFAULT 0"],
   ["baseline_status", "TEXT NOT NULL DEFAULT 'pending'"],
   ["baseline_duration_ms", "INTEGER"],
   ["baseline_findings_json", "TEXT"],
@@ -403,16 +447,35 @@ for (const [name, definition] of [
   ["project_name", "TEXT"],
   ["repository_name", "TEXT NOT NULL DEFAULT ''"],
   ["path_filter", "TEXT"],
+  ["collection_mode", "TEXT NOT NULL DEFAULT 'strict_confirmed'"],
+  ["confirmation_words_json", "TEXT NOT NULL DEFAULT '[]'"],
   ["scan_current", "INTEGER NOT NULL DEFAULT 0"],
   ["scan_total", "INTEGER NOT NULL DEFAULT 0"],
+  ["scan_current_prs", "TEXT"],
   ["collected_count", "INTEGER NOT NULL DEFAULT 0"],
+  ["pr_number_greater_than", "INTEGER"],
+  ["pr_number_less_than", "INTEGER"],
+  ["pr_created_before", "TEXT"],
   ["baseline_concurrency", "INTEGER NOT NULL DEFAULT 5"],
+  ["build_knowledge_graph", "INTEGER NOT NULL DEFAULT 0"],
   ["local_repo_path", "TEXT"],
   ["local_repo_branch", "TEXT"],
   ["local_repo_warning", "TEXT"],
 ] as const) {
   if (!repositoryColumns.some((column) => column.name === name)) {
     db.exec(`ALTER TABLE repositories ADD COLUMN ${name} ${definition}`);
+  }
+
+  const datasetScanColumns = db
+    .prepare("PRAGMA table_info(dataset_scan_runs)")
+    .all() as Array<{ name: string }>;
+  for (const [name, definition] of [
+    ["failed_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["failed_prs_json", "TEXT NOT NULL DEFAULT '[]'"],
+  ] as const) {
+    if (!datasetScanColumns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE dataset_scan_runs ADD COLUMN ${name} ${definition}`);
+    }
   }
 }
 
@@ -440,6 +503,28 @@ const runColumns = db.prepare("PRAGMA table_info(runs)").all() as Array<{
 if (!runColumns.some((column) => column.name === "model_secondary")) {
   db.exec(
     "ALTER TABLE runs ADD COLUMN model_secondary TEXT NOT NULL DEFAULT 'gpt-5.4'",
+  );
+}
+
+const personalReviewSkillColumns = db
+  .prepare("PRAGMA table_info(personal_review_skills)")
+  .all() as Array<{ name: string }>;
+if (
+  !personalReviewSkillColumns.some(
+    (column) => column.name === "trigger_instruction",
+  )
+) {
+  db.exec(
+    "ALTER TABLE personal_review_skills ADD COLUMN trigger_instruction TEXT NOT NULL DEFAULT ''",
+  );
+}
+if (
+  !personalReviewSkillColumns.some(
+    (column) => column.name === "execution_mode",
+  )
+) {
+  db.exec(
+    "ALTER TABLE personal_review_skills ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'copilot-skill'",
   );
 }
 
@@ -589,6 +674,7 @@ const personalSkillResultColumns = db
 for (const [name, definition] of [
   ["repository_context_mode", "TEXT NOT NULL DEFAULT 'diff'"],
   ["repository_commit", "TEXT"],
+  ["skill_snapshot_path", "TEXT"],
 ] as const) {
   if (!personalSkillResultColumns.some((column) => column.name === name)) {
     db.exec(
@@ -596,6 +682,39 @@ for (const [name, definition] of [
     );
   }
 }
+
+const workflowTaskColumns = db
+  .prepare("PRAGMA table_info(workflow_tasks)")
+  .all() as Array<{ name: string }>;
+for (const [name, definition] of [
+  ["training_job_id", "INTEGER"],
+  ["training_iteration", "INTEGER"],
+] as const) {
+  if (!workflowTaskColumns.some((column) => column.name === name)) {
+    db.exec(`ALTER TABLE workflow_tasks ADD COLUMN ${name} ${definition}`);
+  }
+}
+
+const skillAnalysisJobColumns = db
+  .prepare("PRAGMA table_info(skill_analysis_jobs)")
+  .all() as Array<{ name: string }>;
+for (const [name, definition] of [
+  ["training_job_id", "INTEGER"],
+  ["training_iteration", "INTEGER"],
+] as const) {
+  if (!skillAnalysisJobColumns.some((column) => column.name === name)) {
+    db.exec(`ALTER TABLE skill_analysis_jobs ADD COLUMN ${name} ${definition}`);
+  }
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_training_iteration
+    ON workflow_tasks(training_job_id, training_iteration)
+    WHERE training_job_id IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_training_iteration
+    ON skill_analysis_jobs(training_job_id, training_iteration)
+    WHERE training_job_id IS NOT NULL;
+`);
 
 initializeHistorySnapshots(db);
 

@@ -27,6 +27,10 @@ inspect benchmark reports.
 
 Do not start only `npm run dev` for scheduled or long-running evaluations; the
 worker is responsible for repository scans, schedules, and review jobs.
+`npm run dev:all` uses a development worker supervisor so workflow-code changes
+gracefully restart the worker and keep its runtime version synchronized with
+the UI. The supervisor must wait for active work to finish before starting the
+updated worker; never overlap old and new worker processes.
 
 ## Configure an evaluation
 
@@ -81,7 +85,11 @@ After collection, open the repository PR workspace:
 8. Open the per-PR comparison report.
 
 The workspace must show the command shape used to expose the user skill to
-Copilot. Baseline reviews must not load that skill.
+Copilot beneath each selected personal skill. Users may save a per-skill review
+instruction, and the evaluator must use that saved instruction for future
+reviews. Native `wz-review` keeps its trusted `/wz-review` source, output, base,
+and diff-only arguments; the saved instruction is additional context and never
+replaces the native command. Baseline reviews must not load that skill.
 
 ## Evaluation guarantees
 
@@ -90,9 +98,17 @@ Preserve these controls:
 - Every baseline and personal-skill review is permanently local-only. Never pass
   or honor skill publication options such as `--allowpublish`,
   `--autopublish-active`, or `--publish-existing`.
-- Run every review subprocess with outbound and local network access disabled,
-  sandbox bypass disabled, remote MCPs disabled, and Git/GitHub credential
-  injection disabled. A review must fail closed if that sandbox cannot run.
+- Run baseline and generic personal-skill review subprocesses with outbound and
+  local network access disabled, sandbox bypass disabled, remote MCPs disabled,
+  and Git/GitHub credential injection disabled. They must fail closed if that
+  sandbox cannot run.
+- Native `wz-review` is the sole trusted sandbox exception when the host cannot
+  provide Copilot command sandboxing. Never pass or honor any publication
+  option, keep URL tools and remote MCPs disabled, hide credential environment
+  variables, use isolated empty Azure and GitHub CLI configuration directories,
+  and show the trusted exception in the UI. The user accepts responsibility for
+  ambient credentials that tools might discover outside those isolated
+  locations.
 - Never create, update, delete, resolve, approve, or otherwise modify pull
   request comments, reviews, votes, statuses, labels, branches, or other remote
   state. This restriction applies equally to baseline reviews, generic personal

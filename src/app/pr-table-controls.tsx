@@ -7,6 +7,10 @@ type PrTableControlsProps = {
   onPathFilterChange?: (value: string) => void;
   pathFilterEnabled?: boolean;
   onPathFilterEnabledChange?: (value: boolean) => void;
+  selectionMethod?: "all" | "strict_confirmed" | "resolved_comments" | "manual";
+  onSelectionMethodChange?: (
+    value: "all" | "strict_confirmed" | "resolved_comments" | "manual",
+  ) => void;
   showSelectedOnly?: boolean;
   onShowSelectedOnlyChange?: (value: boolean) => void;
   showReviewedOnly?: boolean;
@@ -30,6 +34,8 @@ export function PrTableControls({
   onPathFilterChange,
   pathFilterEnabled,
   onPathFilterEnabledChange,
+  selectionMethod,
+  onSelectionMethodChange,
   showSelectedOnly,
   onShowSelectedOnlyChange,
   showReviewedOnly,
@@ -58,6 +64,11 @@ export function PrTableControls({
             onChange={(event) => onSearchChange(event.target.value)}
           />
         </label>
+        {selectionMethod !== undefined && pathFilter !== undefined && (
+          <span className="prFilterSeparator" aria-hidden="true">
+            |
+          </span>
+        )}
         {pathFilter !== undefined && onPathFilterChange && (
           <label className="prPathFilterField">
             <span>Changed file path</span>
@@ -81,6 +92,40 @@ export function PrTableControls({
               />
               <span>Apply path filter</span>
             </label>
+          )}
+        {selectionMethod !== undefined && (
+          <span className="prFilterSeparator" aria-hidden="true">
+            |
+          </span>
+        )}
+        {selectionMethod !== undefined && onSelectionMethodChange && (
+          <label className="prSelectionMethodField">
+            <span>Selection method</span>
+            <select
+              value={selectionMethod}
+              onChange={(event) =>
+                onSelectionMethodChange(
+                  event.target.value as
+                    | "all"
+                    | "strict_confirmed"
+                    | "resolved_comments"
+                    | "manual",
+                )
+              }
+            >
+              <option value="all">All methods</option>
+              <option value="strict_confirmed">Strictly confirmed</option>
+              <option value="resolved_comments">All resolved</option>
+              <option value="manual">Manual PRs</option>
+            </select>
+          </label>
+        )}
+        {selectionMethod !== undefined &&
+          (showSelectedOnly !== undefined ||
+            showReviewedOnly !== undefined) && (
+            <span className="prFilterSeparator" aria-hidden="true">
+              |
+            </span>
           )}
         {showSelectedOnly !== undefined && onShowSelectedOnlyChange && (
           <label className="prTableToggle">
@@ -119,7 +164,7 @@ export function PrTableControls({
       </div>
       <div className="prTablePagination">
         <label className="prPageSize">
-          <span>PRs per page</span>
+          <span>Maximum PRs per page</span>
           <input
             type="number"
             min={1}
@@ -132,7 +177,7 @@ export function PrTableControls({
         <span className="prTableResultCount">
           {filteredCount === totalCount
             ? `${totalCount} PRs`
-            : `${filteredCount} of ${totalCount} PRs`}
+            : `${filteredCount} matching PRs (${totalCount} total)`}
         </span>
         <button
           type="button"
