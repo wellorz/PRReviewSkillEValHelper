@@ -45,6 +45,7 @@ Every behavior-changing pull request must provide targeted tests and pass:
 
 ```text
 npm test
+npx next typegen
 npx tsc --noEmit
 npm run validate:repository
 npm run validate:docs

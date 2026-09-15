@@ -14,6 +14,7 @@ const packageJson = JSON.parse(read("package.json")) as {
 };
 const documentedCommands = [
   "npm test",
+  "npx next typegen",
   "npx tsc --noEmit",
   "npm run validate:repository",
   "npm run validate:docs",
