@@ -1110,6 +1110,32 @@ export function nativeWzReviewArtifactError(
   return `wzReview did not create required artifacts: ${missingArtifacts.join(", ")}`;
 }
 
+export function nativeWzReviewCompletionError(
+  output: { stdout: string; stderr: string },
+  missingArtifacts: string[],
+) {
+  return missingArtifacts.length > 0
+    ? nativeWzReviewArtifactError(output, missingArtifacts)
+    : null;
+}
+
+export function nativeWzReviewSourceMatches(
+  source: Record<string, unknown>,
+  options: {
+    sourceCommit?: string;
+    targetCommit?: string;
+    diffOnly?: boolean;
+  },
+) {
+  return (
+    options.diffOnly ||
+    !options.sourceCommit ||
+    !options.targetCommit ||
+    (source.headSha === options.sourceCommit &&
+      source.baseSha === options.targetCommit)
+  );
+}
+
 export async function runNativeWzReview(options: {
   repositoryRoot: string;
   outputFolder: string;
@@ -1146,9 +1172,10 @@ export async function runNativeWzReview(options: {
     const existingSource = parseYaml(
       await fs.readFile(path.join(options.outputFolder, "source.yaml"), "utf8"),
     ) as Record<string, unknown>;
-    existingArtifactsComplete =
-      existingSource.headSha === options.sourceCommit &&
-      existingSource.baseSha === options.targetCommit;
+    existingArtifactsComplete = nativeWzReviewSourceMatches(
+      existingSource,
+      options,
+    );
   }
   let durationMs = 0;
   let invocationOutput = { stdout: "", stderr: "" };
@@ -1208,9 +1235,6 @@ export async function runNativeWzReview(options: {
       options.usagePath.replace(/-usage\.json$/i, "-output.txt"),
       `${result.stdout}\n\n--- STDERR ---\n${result.stderr}`,
     );
-    if (result.exitCode !== 0) {
-      throw new Error(result.stderr.trim() || "wzReview invocation failed");
-    }
   } else {
     invocationOutput.stdout = await fs
       .readFile(
@@ -1234,10 +1258,22 @@ export async function runNativeWzReview(options: {
   )
     .filter((item) => !item.exists)
     .map((item) => item.artifact);
-  if (missingArtifacts.length > 0) {
-    throw new Error(
-      nativeWzReviewArtifactError(invocationOutput, missingArtifacts),
-    );
+  const completionError = nativeWzReviewCompletionError(
+    invocationOutput,
+    missingArtifacts,
+  );
+  if (completionError) {
+    throw new Error(completionError);
+  }
+  if (!options.diffOnly && options.sourceCommit && options.targetCommit) {
+    const source = parseYaml(
+      await fs.readFile(path.join(options.outputFolder, "source.yaml"), "utf8"),
+    ) as Record<string, unknown>;
+    if (!nativeWzReviewSourceMatches(source, options)) {
+      throw new Error(
+        "wzReview artifacts do not match the requested source and target commits",
+      );
+    }
   }
 
   const reviewResultPath = path.join(

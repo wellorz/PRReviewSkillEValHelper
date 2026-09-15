@@ -7,7 +7,9 @@ import {
   localOnlySandboxSettings,
   isUnavailableModelError,
   nativeWzReviewArtifactError,
+  nativeWzReviewCompletionError,
   nativeWzReviewPrompt,
+  nativeWzReviewSourceMatches,
   nativeReviewerModels,
   parseCodeReadingKnowledgeOutput,
   parseSkillAnalysisOutput,
@@ -199,6 +201,36 @@ test("reports unsupported Windows sandboxing instead of missing artifacts", () =
   assert.match(message, /requires BaseContainer/);
   assert.match(message, /Sandbox enforcement was not bypassed/);
   assert.doesNotMatch(message, /did not create required artifacts/);
+});
+
+test("accepts complete native wzReview artifacts after a trailing command failure", () => {
+  assert.equal(
+    nativeWzReviewCompletionError(
+      {
+        stdout: "Review complete. Generated and validated review-result.yaml.",
+        stderr: "Execution failed: 400 Bad Request",
+      },
+      [],
+    ),
+    null,
+  );
+});
+
+test("rejects native wzReview artifacts for different commits", () => {
+  assert.equal(
+    nativeWzReviewSourceMatches(
+      { headSha: "other-head", baseSha: "target" },
+      { sourceCommit: "source", targetCommit: "target" },
+    ),
+    false,
+  );
+  assert.equal(
+    nativeWzReviewSourceMatches(
+      { headSha: "source", baseSha: "target" },
+      { sourceCommit: "source", targetCommit: "target" },
+    ),
+    true,
+  );
 });
 
 test("keeps baseline and personal-skill reviews permanently local", () => {

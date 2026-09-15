@@ -458,10 +458,7 @@ function skillResultFor(
       result.model_secondary === settings.modelSecondary &&
       result.context_tier === settings.contextTier,
   );
-  if (
-    exact ||
-    (!isNativeWzReviewSkill(skill) && !isNativeDevLoopSkill(skill))
-  ) {
+  if (exact || !isNativeDevLoopSkill(skill)) {
     return exact;
   }
   return candidates.reduce<NormalizedResult | undefined>(
