@@ -34,7 +34,7 @@
     "concurrently": "^10.0.5",
     "eslint": "^9",
     "eslint-config-next": "16.4.0-canary.9",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.13",
     "typescript": "^5"
   }
 }
