@@ -2376,50 +2376,52 @@ export default function RepositoryWorkspacePage() {
                     : "Set Local repository path to enable repository-backed code reading."}
                 </span>
               </label>
-              <button
-                type="button"
-                className={
-                  activeTrainingJob
-                    ? "dangerButton trainingActionButton"
-                    : "primaryButton compact trainingActionButton"
-                }
-                disabled={
-                  activeTrainingJob
-                    ? busy === "cancel-personal-skill-training" ||
-                      activeTrainingJob.status === "cancelling"
-                    : activeReviewTasks.length > 0 ||
-                      activeAnalysisJobs.length > 0 ||
-                      busy === "train-personal-skill" ||
-                      selectedSkills.length !== 1 ||
-                      selectedPathFilteredPrIds.length === 0 ||
-                      !currentSettings.localRepoPath.trim() ||
-                      !currentSettings.localRepoBranch.trim()
-                }
-                onClick={() =>
-                  void (activeTrainingJob
-                    ? cancelPersonalSkillTraining(activeTrainingJob)
-                    : startPersonalSkillTraining())
-                }
-              >
-                {busy === "cancel-personal-skill-training" ||
-                activeTrainingJob?.status === "cancelling"
-                  ? "Cancelling..."
-                  : activeTrainingJob
-                    ? "Cancel Training"
-                    : busy === "train-personal-skill"
-                      ? "Queuing..."
-                      : "Train Personal Skill"}
-              </button>
-              <button
-                type="button"
-                className="secondaryButton trainingProgressButton"
-                disabled={!latestTrainingJob}
-                onClick={() =>
-                  setTrainingProgressJobId(latestTrainingJob?.id ?? null)
-                }
-              >
-                View Progress
-              </button>
+              <div className="trainingActions">
+                <button
+                  type="button"
+                  className={
+                    activeTrainingJob
+                      ? "dangerButton trainingActionButton"
+                      : "primaryButton compact trainingActionButton"
+                  }
+                  disabled={
+                    activeTrainingJob
+                      ? busy === "cancel-personal-skill-training" ||
+                        activeTrainingJob.status === "cancelling"
+                      : activeReviewTasks.length > 0 ||
+                        activeAnalysisJobs.length > 0 ||
+                        busy === "train-personal-skill" ||
+                        selectedSkills.length !== 1 ||
+                        selectedPathFilteredPrIds.length === 0 ||
+                        !currentSettings.localRepoPath.trim() ||
+                        !currentSettings.localRepoBranch.trim()
+                  }
+                  onClick={() =>
+                    void (activeTrainingJob
+                      ? cancelPersonalSkillTraining(activeTrainingJob)
+                      : startPersonalSkillTraining())
+                  }
+                >
+                  {busy === "cancel-personal-skill-training" ||
+                  activeTrainingJob?.status === "cancelling"
+                    ? "Cancelling..."
+                    : activeTrainingJob
+                      ? "Cancel Training"
+                      : busy === "train-personal-skill"
+                        ? "Queuing..."
+                        : "Train Personal Skill"}
+                </button>
+                <button
+                  type="button"
+                  className="secondaryButton trainingProgressButton"
+                  disabled={!latestTrainingJob}
+                  onClick={() =>
+                    setTrainingProgressJobId(latestTrainingJob?.id ?? null)
+                  }
+                >
+                  View Progress
+                </button>
+              </div>
             </div>
           </div>
           <p>

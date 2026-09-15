@@ -1584,16 +1584,24 @@ footer {
 }
 
 .knowledgeGraphAction {
+  flex-direction: column;
+  align-items: stretch;
+  width: min(520px, 100%);
   max-width: 520px;
   margin-left: auto;
+}
+
+.knowledgeGraphAction .reviewActionTitle {
   justify-content: flex-end;
 }
 
 .knowledgeGraphToggle {
   display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 9px;
-  max-width: 310px;
+  width: 100%;
+  max-width: none;
   color: var(--muted);
   font-size: 11px;
   font-weight: 700;
@@ -1635,8 +1643,15 @@ footer {
 .trainingActionButton {
   flex: none;
   min-height: 36px;
-  margin-left: auto;
   white-space: nowrap;
+}
+
+.trainingActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+  gap: 10px;
 }
 
 .trainingProgressButton {
