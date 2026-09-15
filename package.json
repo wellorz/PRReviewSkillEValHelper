@@ -9,6 +9,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "tsx --test \"src/**/*.test.ts\"",
+    "validate:repository": "tsx scripts/validate-repository-contract.ts",
     "worker": "tsx scripts/worker.ts",
     "worker:dev": "tsx scripts/dev-worker.ts"
   },

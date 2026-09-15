@@ -1,0 +1,32 @@
+schemaVersion: 1
+
+review:
+  requiredCommands:
+    - npm test
+    - npx tsc --noEmit
+    - npm run lint
+    - npm run build
+  requireCodeOwnerReview: true
+  requireRollbackDescription: true
+
+safety:
+  localOnlyReviews: true
+  humanFindingsModelVisible: false
+  prohibitedPublicationFlags:
+    - --allowpublish
+    - --autopublish-active
+    - --publish-existing
+
+training:
+  maximumRetriesPerPullRequest: 5
+  unavailableModelPolicy: retry-same-model
+  cancellationRequired: true
+  preserveCompletedWork: true
+
+evidence:
+  completionArtifact: quality-summary
+  reportPaths:
+    - data/runs/run-<id>/summary.md
+    - data/runs/run-<id>/pr-<number>/report.md
+  dashboardPath: src/app/repositories/[id]/page.tsx
+

@@ -1,0 +1,52 @@
+name: Repository Quality Report
+
+on:
+  workflow_run:
+    workflows:
+      - Repository Quality
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  report:
+    name: Summarize validation result
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download completion signal
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: quality-summary
+          path: artifacts
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Write durable run summary
+        shell: pwsh
+        run: |
+          "## Repository Quality" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "- Source run: ${{ github.event.workflow_run.html_url }}" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "- Conclusion: **${{ github.event.workflow_run.conclusion }}**" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "- Commit: `${{ github.event.workflow_run.head_sha }}`" | Add-Content $env:GITHUB_STEP_SUMMARY
+          if (Test-Path "artifacts\quality-summary.json") {
+            "" | Add-Content $env:GITHUB_STEP_SUMMARY
+            "### Machine-readable signal" | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```json' | Add-Content $env:GITHUB_STEP_SUMMARY
+            Get-Content "artifacts\quality-summary.json" | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Enforce source conclusion
+        if: github.event.workflow_run.conclusion != 'success'
+        shell: pwsh
+        run: |
+          Write-Error "Source quality workflow did not succeed."
+          exit 1
+

@@ -1,0 +1,16 @@
+- name: dependencies
+  color: "0366d6"
+  description: Dependency updates
+- name: github-actions
+  color: "2088ff"
+  description: GitHub Actions maintenance
+- name: agent-generated
+  color: "8250df"
+  description: Change authored or coauthored by an AI coding agent
+- name: needs-human-review
+  color: "d93f0b"
+  description: Requires an explicit human decision
+- name: benchmark
+  color: "0e8a16"
+  description: PR-review benchmark behavior or evidence
+
