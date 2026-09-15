@@ -1,0 +1,19 @@
+schemaVersion: 1
+
+qualityFailure:
+  signal: Repository Quality workflow conclusion is failure
+  containment: rerun-failed-jobs
+  maximumAutomaticReruns: 1
+  workflow: .github/workflows/quality-recovery.yml
+  exhaustedAction: require-human-review
+
+rollback:
+  applicationChanges: revert the responsible commit through a reviewed pull request
+  skillMitigations: restore the backup created before the append-only edit
+  databaseMigrations: apply a forward corrective migration; never delete local benchmark state
+
+safety:
+  automaticCodeMutation: false
+  automaticMerge: false
+  remoteReviewPublication: false
+

@@ -1,10 +1,9 @@
-import path from "node:path";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getDb } from "@/lib/db";
 import { parseRepositorySource } from "@/lib/repository-source";
-import { normalizeModelId } from "@/lib/models";
 import { repositorySyncQueueMessage } from "@/lib/repository-queue";
+import { resolveRepositoryReviewSettings } from "@/lib/repository-review-settings";
 import {
   COLLECTION_MODES,
   normalizeConfirmationWords,
@@ -12,10 +11,10 @@ import {
 
 const repositorySchema = z.object({
   slug: z.string().trim().min(1),
-  skillPath: z.string().trim().min(1).optional().default("."),
-  model: z.string().trim().min(1).default("gpt-5.4"),
-  modelSecondary: z.string().trim().min(1).default("gpt-5.4"),
-  contextTier: z.enum(["default", "long_context"]).default("default"),
+  skillPath: z.string().trim().min(1).optional(),
+  model: z.string().trim().min(1).optional(),
+  modelSecondary: z.string().trim().min(1).optional(),
+  contextTier: z.enum(["default", "long_context"]).optional(),
   targetPrs: z.number().int().min(1).max(100).default(100),
   scanLimit: z.number().int().min(1).max(10_000).default(2_000),
   usePathFilter: z.boolean().default(true),
@@ -28,7 +27,7 @@ const repositorySchema = z.object({
     z.literal(""),
     z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   ]).default(""),
-  baselineConcurrency: z.number().int().min(1).max(20).default(5),
+  baselineConcurrency: z.number().int().min(1).max(20).optional(),
 }).superRefine((input, context) => {
   if (
     input.prNumberGreaterThan != null &&
@@ -73,19 +72,32 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
-  const skillPath = path.resolve(input.skillPath);
-  let model: string;
-  let modelSecondary: string;
+  const db = getDb();
+  const existing = db
+    .prepare(`
+      SELECT skill_path, model, model_secondary, context_tier,
+        baseline_concurrency
+      FROM repositories
+      WHERE slug = ?
+    `)
+    .get(source.key) as
+    | {
+        skill_path: string;
+        model: string;
+        model_secondary: string;
+        context_tier: string;
+        baseline_concurrency: number;
+      }
+    | undefined;
+  let reviewSettings;
   try {
-    model = normalizeModelId(input.model);
-    modelSecondary = normalizeModelId(input.modelSecondary);
+    reviewSettings = resolveRepositoryReviewSettings(input, existing);
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },
       { status: 400 },
     );
   }
-  const db = getDb();
   db.prepare(`
     INSERT INTO repositories (
       slug, display_name, provider, clone_url, organization_url, project_name,
@@ -131,18 +143,18 @@ export async function POST(request: Request) {
     source.projectName,
     source.repositoryName,
     input.usePathFilter ? input.pathFilter || source.suggestedPathFilter : "",
-    skillPath,
-    model,
-    modelSecondary,
+    reviewSettings.skillPath,
+    reviewSettings.model,
+    reviewSettings.modelSecondary,
     input.collectionMode,
     JSON.stringify(normalizeConfirmationWords(input.confirmationWords)),
-    input.contextTier,
+    reviewSettings.contextTier,
     input.targetPrs,
     input.scanLimit,
     input.prNumberGreaterThan,
     input.prNumberLessThan,
     input.prCreatedBefore || null,
-    input.baselineConcurrency,
+    reviewSettings.baselineConcurrency,
   );
   const repository = db
     .prepare("SELECT * FROM repositories WHERE slug = ?")

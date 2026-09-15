@@ -1,0 +1,39 @@
+name: Repository Quality Recovery
+
+on:
+  workflow_run:
+    workflows:
+      - Repository Quality
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  retry-failed-jobs-once:
+    name: Retry failed validation jobs once
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record containment decision
+        shell: pwsh
+        run: |
+          "## Bounded quality recovery" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "Retrying only failed jobs from source run $env:SOURCE_RUN_ID." | Add-Content $env:GITHUB_STEP_SUMMARY
+          "The source run attempt is limited to one automatic rerun." | Add-Content $env:GITHUB_STEP_SUMMARY
+        env:
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+
+      - name: Rerun failed jobs
+        shell: pwsh
+        run: gh run rerun $env:SOURCE_RUN_ID --failed --repo $env:GITHUB_REPOSITORY
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+

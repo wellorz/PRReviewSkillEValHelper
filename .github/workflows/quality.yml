@@ -43,6 +43,12 @@ jobs:
       - name: Validate repository operating contract
         run: npm run validate:repository
 
+      - name: Validate documentation against code
+        run: npm run validate:docs
+
+      - name: Validate workflow PowerShell
+        run: npm run validate:workflows
+
       - name: Lint
         run: npm run lint
 

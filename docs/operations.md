@@ -11,6 +11,10 @@ event, revision, and validation conclusion.
 GitHub Actions run summary. A failed source run produces a failed chained
 report rather than a success-shaped fallback.
 
+`Repository Quality Recovery` contains a failed validation run by rerunning
+only its failed jobs once. A second failure stops automatic action and requires
+human review. Recovery never changes code or merges a pull request.
+
 ## Scheduled maintenance
 
 Every Monday, repository quality runs the full validation path and captures an
@@ -45,3 +49,7 @@ reviews and applied mitigations survive cancellation and worker restart.
 - Skill edits are backed up and append-only. Reverting the affected skill file
   to its backup is the rollback path for an incorrect mitigation.
 
+`npm run validate:docs` checks the versioned review/training specification,
+operating policy, self-healing bounds, required documentation, and package
+commands. The blocking repository-quality workflow executes this check on each
+pull request.

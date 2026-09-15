@@ -17,6 +17,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 5
     steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
       - name: Download completion signal
         id: download
         continue-on-error: true
@@ -29,19 +32,11 @@ jobs:
 
       - name: Write durable run summary
         shell: pwsh
-        run: |
-          "## Repository Quality" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "- Source run: ${{ github.event.workflow_run.html_url }}" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "- Conclusion: **${{ github.event.workflow_run.conclusion }}**" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "- Commit: `${{ github.event.workflow_run.head_sha }}`" | Add-Content $env:GITHUB_STEP_SUMMARY
-          if (Test-Path "artifacts\quality-summary.json") {
-            "" | Add-Content $env:GITHUB_STEP_SUMMARY
-            "### Machine-readable signal" | Add-Content $env:GITHUB_STEP_SUMMARY
-            '```json' | Add-Content $env:GITHUB_STEP_SUMMARY
-            Get-Content "artifacts\quality-summary.json" | Add-Content $env:GITHUB_STEP_SUMMARY
-            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
-          }
+        run: .\scripts\ci\write-quality-report.ps1
+        env:
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
 
       - name: Enforce source conclusion
         if: github.event.workflow_run.conclusion != 'success'
@@ -49,4 +44,3 @@ jobs:
         run: |
           Write-Error "Source quality workflow did not succeed."
           exit 1
-

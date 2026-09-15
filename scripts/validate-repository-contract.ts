@@ -79,11 +79,17 @@ const requiredFiles = [
   ".github/pull_request_template.md",
   ".github/workflows/quality.yml",
   ".github/workflows/quality-report.yml",
+  ".github/workflows/quality-recovery.yml",
   ".github/workflows/codeql.yml",
+  ".github/self-healing.yml",
+  "scripts/ci/write-quality-report.ps1",
+  "scripts/validate-workflow-powershell.ps1",
   "CONTRIBUTING.md",
   "SECURITY.md",
   "docs/architecture.md",
   "docs/operations.md",
+  "docs/threat-model.md",
+  "specs/v1/review-training-contract.md",
 ];
 for (const relativePath of requiredFiles) {
   assert.ok(

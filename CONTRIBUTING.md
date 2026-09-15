@@ -25,6 +25,8 @@ Run the smallest relevant test first, followed by the repository checks:
 npm test
 npx tsc --noEmit
 npm run validate:repository
+npm run validate:docs
+npm run validate:workflows
 npm run lint
 npm run build
 ```
@@ -50,4 +52,3 @@ All benchmark and training reviews are permanently local-only. Contributions
 must not add PR publication flags or remotely mutate comments, reviews, votes,
 statuses, labels, branches, or approvals. Never place `human-findings.json`
 inside a model-visible review workspace.
-
