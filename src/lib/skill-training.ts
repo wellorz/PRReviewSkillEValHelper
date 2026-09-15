@@ -1,11 +1,16 @@
+import path from "node:path";
+import { createAsyncGate, type AsyncGate } from "@/lib/async-gate";
+import {
+  isUnavailableModelError,
+  prepareSkillRoot,
+} from "@/lib/copilot";
 import { getDb } from "@/lib/db";
+import { DATA_DIR } from "@/lib/paths";
 import {
   executeSkillAnalysisJob,
   type SkillAnalysisJob,
 } from "@/lib/skill-analysis";
-import {
-  personalSkillResultConfiguration,
-} from "@/lib/personal-skill-execution";
+import { personalSkillResultConfiguration } from "@/lib/personal-skill-execution";
 import type {
   PersonalReviewSkillRecord,
   RepositoryRecord,
@@ -37,11 +42,18 @@ export type SkillTrainingJob = {
 };
 
 type TrainingHistoryEntry = {
+  pullRequestId: number;
   iteration: number;
-  reviewed: number;
-  zeroCredit: number;
   reviewTaskId: number;
   analysisJobId?: number;
+  earned: number;
+  available: number;
+};
+
+type TrainingResult = {
+  status: string;
+  metrics_json: string | null;
+  error: string | null;
 };
 
 function parseIds(value: string) {
@@ -65,28 +77,6 @@ export function trainingMetricsScore(value: string | null) {
   }
 }
 
-function updateTrainingHistory(
-  jobId: number,
-  entry: TrainingHistoryEntry,
-) {
-  const db = getDb();
-  const row = db
-    .prepare("SELECT history_json FROM skill_training_jobs WHERE id = ?")
-    .get(jobId) as { history_json: string } | undefined;
-  const history = row
-    ? (JSON.parse(row.history_json || "[]") as TrainingHistoryEntry[])
-    : [];
-  const next = [
-    ...history.filter((item) => item.iteration !== entry.iteration),
-    entry,
-  ].sort((left, right) => left.iteration - right.iteration);
-  db.prepare(`
-    UPDATE skill_training_jobs
-    SET history_json = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE id = ? AND status = 'running'
-  `).run(JSON.stringify(next), jobId);
-}
-
 function resultConfiguration(
   repository: RepositoryRecord,
   skill: PersonalReviewSkillRecord,
@@ -98,116 +88,142 @@ function resultConfiguration(
   });
 }
 
-function zeroCreditPullRequests(options: {
+function updateTrainingHistory(jobId: number, entry: TrainingHistoryEntry) {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT history_json FROM skill_training_jobs WHERE id = ?")
+    .get(jobId) as { history_json: string } | undefined;
+  const history = row
+    ? (JSON.parse(row.history_json || "[]") as TrainingHistoryEntry[])
+    : [];
+  const next = [
+    ...history.filter(
+      (item) =>
+        item.pullRequestId !== entry.pullRequestId ||
+        item.iteration !== entry.iteration,
+    ),
+    entry,
+  ].sort(
+    (left, right) =>
+      left.pullRequestId - right.pullRequestId ||
+      left.iteration - right.iteration,
+  );
+  db.prepare(`
+    UPDATE skill_training_jobs
+    SET history_json = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status = 'running'
+  `).run(JSON.stringify(next), jobId);
+}
+
+function readTrainingResult(options: {
   repository: RepositoryRecord;
   skill: PersonalReviewSkillRecord;
-  pullRequestIds: number[];
+  pullRequestId: number;
 }) {
-  const db = getDb();
   const configuration = resultConfiguration(options.repository, options.skill);
-  const placeholders = options.pullRequestIds.map(() => "?").join(",");
-  const rows = db
+  return getDb()
     .prepare(`
-      SELECT pull_request_id, status, metrics_json, error
+      SELECT status, metrics_json, error
       FROM personal_skill_results
-      WHERE skill_id = ?
+      WHERE skill_id = ? AND pull_request_id = ?
         AND model = ? AND model_secondary = ? AND context_tier = ?
-        AND pull_request_id IN (${placeholders})
     `)
-    .all(
+    .get(
       options.skill.id,
+      options.pullRequestId,
       configuration.model,
       configuration.modelSecondary,
       configuration.contextTier,
-      ...options.pullRequestIds,
-    ) as Array<{
-    pull_request_id: number;
-    status: string;
-    metrics_json: string | null;
-    error: string | null;
-  }>;
-  if (rows.length !== options.pullRequestIds.length) {
-    throw new Error("Training review did not produce a result for every PR");
-  }
-  const incomplete = rows.find((row) => row.status !== "completed");
-  if (incomplete) {
-    throw new Error(
-      `Training review did not complete for PR ${incomplete.pull_request_id}: ${incomplete.error ?? incomplete.status}`,
-    );
-  }
-  return rows.flatMap((row) => {
-    const score = trainingMetricsScore(row.metrics_json);
-    if (!score) {
-      throw new Error(
-        `Training review produced no score for PR ${row.pull_request_id}`,
-      );
-    }
-    return score.available > 0 && score.earned === 0
-      ? [row.pull_request_id]
-      : [];
-  });
+    ) as TrainingResult | undefined;
 }
 
-async function runReviewBatch(options: {
+async function prepareTrainingSkillSnapshot(options: {
+  jobId: number;
+  skill: PersonalReviewSkillRecord;
+  pullRequestId: number;
+  iteration: number;
+  mutationGate: AsyncGate;
+}) {
+  return options.mutationGate.run(() =>
+    prepareSkillRoot(
+      options.skill.path,
+      path.join(
+        DATA_DIR,
+        "skill-training",
+        `job-${options.jobId}`,
+        `pr-${options.pullRequestId}`,
+        `attempt-${options.iteration}`,
+      ),
+    ),
+  );
+}
+
+async function runReview(options: {
   job: SkillTrainingJob;
   repository: RepositoryRecord;
   skill: PersonalReviewSkillRecord;
-  pullRequestIds: number[];
+  pullRequestId: number;
   iteration: number;
+  preparedSkillRoot: string;
 }) {
   const db = getDb();
   let task = db
     .prepare(`
       SELECT id, repository_id, kind, pr_ids_json, payload_json, status
       FROM workflow_tasks
-      WHERE training_job_id = ? AND training_iteration = ?
+      WHERE training_job_id = ? AND training_pull_request_id = ?
+        AND training_iteration = ?
     `)
-    .get(options.job.id, options.iteration) as
+    .get(options.job.id, options.pullRequestId, options.iteration) as
     | (WorkflowTask & { status: string })
     | undefined;
   if (!task) {
     const payload = {
-      concurrency: options.repository.baseline_concurrency,
+      concurrency: 1,
       skillIds: [options.skill.id],
       model: options.repository.model,
       modelSecondary: options.repository.model_secondary,
       contextTier: options.repository.context_tier,
       localRepoPath: options.repository.local_repo_path,
       localRepoBranch: options.repository.local_repo_branch,
+      preparedSkillRoots: {
+        [options.skill.id]: options.preparedSkillRoot,
+      },
     };
-    const insert = db.transaction(() => {
-      const result = db
+    const taskId = db.transaction(() => {
+      const inserted = db
         .prepare(`
           INSERT INTO workflow_tasks (
             repository_id, kind, pr_ids_json, payload_json, total_items,
-            status, status_message, training_job_id, training_iteration
-          ) VALUES (?, 'skill_eval', ?, ?, ?, 'running', ?, ?, ?)
+            status, status_message, training_job_id,
+            training_pull_request_id, training_iteration
+          ) VALUES (?, 'skill_eval', ?, ?, 1, 'running', ?, ?, ?, ?)
         `)
         .run(
           options.repository.id,
-          JSON.stringify(options.pullRequestIds),
+          JSON.stringify([options.pullRequestId]),
           JSON.stringify(payload),
-          options.pullRequestIds.length,
           options.iteration === 0
             ? "Training: initial personal skill review"
-            : `Training iteration ${options.iteration}: retrying zero-credit PRs`,
+            : `Training retry ${options.iteration}/${options.job.max_iterations}`,
           options.job.id,
+          options.pullRequestId,
           options.iteration,
         );
       queuePersonalSkillResults(db, {
         skillIds: [options.skill.id],
-        pullRequestIds: options.pullRequestIds,
+        pullRequestIds: [options.pullRequestId],
         model: options.repository.model,
         modelSecondary: options.repository.model_secondary,
         contextTier: options.repository.context_tier,
       });
-      return Number(result.lastInsertRowid);
+      return Number(inserted.lastInsertRowid);
     })();
     task = {
-      id: insert,
+      id: taskId,
       repository_id: options.repository.id,
       kind: "skill_eval",
-      pr_ids_json: JSON.stringify(options.pullRequestIds),
+      pr_ids_json: JSON.stringify([options.pullRequestId]),
       payload_json: JSON.stringify(payload),
       status: "running",
     };
@@ -217,9 +233,7 @@ async function runReviewBatch(options: {
     throw new Error(`Training review task ${task.id} ${task.status}`);
   }
   db.prepare(`
-    UPDATE workflow_tasks
-    SET status = 'running', error = NULL
-    WHERE id = ?
+    UPDATE workflow_tasks SET status = 'running', error = NULL WHERE id = ?
   `).run(task.id);
   try {
     await executeWorkflowTask(task);
@@ -239,11 +253,11 @@ async function runReviewBatch(options: {
   return task.id;
 }
 
-async function runAnalysisBatch(options: {
+async function runAnalysis(options: {
   job: SkillTrainingJob;
   repository: RepositoryRecord;
   skill: PersonalReviewSkillRecord;
-  pullRequestIds: number[];
+  pullRequestId: number;
   iteration: number;
 }) {
   const db = getDb();
@@ -253,20 +267,21 @@ async function runAnalysisBatch(options: {
       SELECT id, repository_id, skill_id, mode, model, model_secondary,
         context_tier, pr_ids_json, status, error
       FROM skill_analysis_jobs
-      WHERE training_job_id = ? AND training_iteration = ?
+      WHERE training_job_id = ? AND training_pull_request_id = ?
+        AND training_iteration = ?
     `)
-    .get(options.job.id, options.iteration) as
+    .get(options.job.id, options.pullRequestId, options.iteration) as
     | (SkillAnalysisJob & { status: string; error: string | null })
     | undefined;
   if (!analysisJob) {
-    const create = db.transaction(() => {
+    const analysisJobId = db.transaction(() => {
       const inserted = db
         .prepare(`
           INSERT INTO skill_analysis_jobs (
             repository_id, skill_id, mode, model, model_secondary,
             context_tier, pr_ids_json, total_items, status, status_message,
-            training_job_id, training_iteration
-          ) VALUES (?, ?, 'analyze_apply', ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            training_job_id, training_pull_request_id, training_iteration
+          ) VALUES (?, ?, 'analyze_apply', ?, ?, ?, ?, 1, 'running', ?, ?, ?, ?)
         `)
         .run(
           options.repository.id,
@@ -274,13 +289,13 @@ async function runAnalysisBatch(options: {
           configuration.model,
           configuration.modelSecondary,
           configuration.contextTier,
-          JSON.stringify(options.pullRequestIds),
-          options.pullRequestIds.length,
-          `Training iteration ${options.iteration}: analyzing and applying gaps`,
+          JSON.stringify([options.pullRequestId]),
+          `Training retry ${options.iteration}: analyzing and applying gap`,
           options.job.id,
+          options.pullRequestId,
           options.iteration,
         );
-      const upsert = db.prepare(`
+      db.prepare(`
         INSERT INTO skill_analysis_results (
           skill_id, pull_request_id, model, model_secondary, context_tier,
           status
@@ -292,27 +307,24 @@ async function runAnalysisBatch(options: {
           proposal_json = NULL, usage_json = NULL, raw_output = NULL,
           error = NULL, applied_at = NULL, application_error = NULL,
           updated_at = CURRENT_TIMESTAMP
-      `);
-      for (const pullRequestId of options.pullRequestIds) {
-        upsert.run(
-          options.skill.id,
-          pullRequestId,
-          configuration.model,
-          configuration.modelSecondary,
-          configuration.contextTier,
-        );
-      }
+      `).run(
+        options.skill.id,
+        options.pullRequestId,
+        configuration.model,
+        configuration.modelSecondary,
+        configuration.contextTier,
+      );
       return Number(inserted.lastInsertRowid);
     })();
     analysisJob = {
-      id: create,
+      id: analysisJobId,
       repository_id: options.repository.id,
       skill_id: options.skill.id,
       mode: "analyze_apply",
       model: configuration.model,
       model_secondary: configuration.modelSecondary,
       context_tier: configuration.contextTier,
-      pr_ids_json: JSON.stringify(options.pullRequestIds),
+      pr_ids_json: JSON.stringify([options.pullRequestId]),
       status: "running",
       error: null,
     };
@@ -321,13 +333,13 @@ async function runAnalysisBatch(options: {
     if (analysisJob.error) throw new Error(analysisJob.error);
     return analysisJob.id;
   }
-  if (analysisJob.status === "failed") {
-    throw new Error(analysisJob.error ?? "Training analysis failed");
+  if (analysisJob.status === "failed" || analysisJob.status === "cancelled") {
+    throw new Error(
+      analysisJob.error ?? `Training analysis ${analysisJob.status}`,
+    );
   }
   db.prepare(`
-    UPDATE skill_analysis_jobs
-    SET status = 'running', error = NULL
-    WHERE id = ?
+    UPDATE skill_analysis_jobs SET status = 'running', error = NULL WHERE id = ?
   `).run(analysisJob.id);
   try {
     await executeSkillAnalysisJob(analysisJob);
@@ -422,121 +434,177 @@ async function runSkillTrainingJob(job: SkillTrainingJob) {
       "Training requires a verified Local repository path and branch",
     );
   }
-  const selectedIds = parseIds(job.pr_ids_json);
+  const trainingRepository = repository;
+  const trainingSkill = skill;
+  const pullRequestIds = parseIds(job.pr_ids_json);
+  const concurrency = Math.max(
+    1,
+    Math.min(
+      repository.baseline_concurrency,
+      Math.max(1, pullRequestIds.length),
+    ),
+  );
   db.prepare(`
     UPDATE skill_training_jobs
     SET status = 'running', started_at = COALESCE(started_at, ?),
-      error = NULL, total_items = ?, updated_at = CURRENT_TIMESTAMP
+      error = NULL, total_items = ?, status_message = ?,
+      updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
-  `).run(new Date().toISOString(), selectedIds.length, job.id);
+  `).run(
+    new Date().toISOString(),
+    pullRequestIds.length,
+    `Training with ${concurrency} parallel PR pipelines`,
+    job.id,
+  );
 
-  let reviewTaskId = await runReviewBatch({
-    job,
-    repository,
-    skill,
-    pullRequestIds: selectedIds,
-    iteration: 0,
-  });
-  throwIfWorkflowCancelled();
-  let zeroCreditIds = zeroCreditPullRequests({
-    repository,
-    skill,
-    pullRequestIds: selectedIds,
-  });
-  updateTrainingHistory(job.id, {
-    iteration: 0,
-    reviewed: selectedIds.length,
-    zeroCredit: zeroCreditIds.length,
-    reviewTaskId,
-  });
-  if (zeroCreditIds.length === 0) {
+  const mutationGate = createAsyncGate(1);
+  const remainingZeroCredit = new Set<number>();
+  const failures: string[] = [];
+  let nextIndex = 0;
+  let completed = 0;
+  let active = 0;
+
+  function updateProgress(message?: string) {
     db.prepare(`
       UPDATE skill_training_jobs
-      SET status = 'completed', current_pr_ids_json = '[]',
-        current_item = total_items, status_message = 'Training complete: every selected PR earned credit',
-        completed_at = ?, updated_at = CURRENT_TIMESTAMP
+      SET current_item = ?, current_pr_ids_json = ?,
+        status_message = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND status = 'running'
-    `).run(new Date().toISOString(), job.id);
-    return;
+    `).run(
+      completed,
+      JSON.stringify([...remainingZeroCredit]),
+      message ??
+        `Training with ${concurrency} pipelines · ${completed}/${pullRequestIds.length} PRs complete · ${active} active`,
+      job.id,
+    );
   }
 
-  for (let iteration = 1; iteration <= job.max_iterations; iteration += 1) {
-    db.prepare(`
-      UPDATE skill_training_jobs
-      SET current_iteration = ?, current_pr_ids_json = ?,
-        current_item = ?, status_message = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(
-      iteration,
-      JSON.stringify(zeroCreditIds),
-      selectedIds.length - zeroCreditIds.length,
-      `Training iteration ${iteration}/${job.max_iterations}: analyzing ${zeroCreditIds.length} zero-credit PRs`,
-      job.id,
-    );
-    const analysisJobId = await runAnalysisBatch({
-      job,
-      repository,
-      skill,
-      pullRequestIds: zeroCreditIds,
-      iteration,
-    });
-    throwIfWorkflowCancelled();
-    db.prepare(`
-      UPDATE skill_training_jobs
-      SET status_message = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(
-      `Training iteration ${iteration}/${job.max_iterations}: retrying ${zeroCreditIds.length} PRs`,
-      job.id,
-    );
-    const reviewedIds = zeroCreditIds;
-    reviewTaskId = await runReviewBatch({
-      job,
-      repository,
-      skill,
-      pullRequestIds: reviewedIds,
-      iteration,
-    });
-    throwIfWorkflowCancelled();
-    zeroCreditIds = zeroCreditPullRequests({
-      repository,
-      skill,
-      pullRequestIds: reviewedIds,
-    });
-    updateTrainingHistory(job.id, {
-      iteration,
-      reviewed: reviewedIds.length,
-      zeroCredit: zeroCreditIds.length,
-      reviewTaskId,
-      analysisJobId,
-    });
-    if (zeroCreditIds.length === 0) {
+  async function trainPullRequest(pullRequestId: number) {
+    for (
+      let iteration = 0;
+      iteration <= job.max_iterations;
+      iteration += 1
+    ) {
+      throwIfWorkflowCancelled();
       db.prepare(`
         UPDATE skill_training_jobs
-        SET status = 'completed', current_pr_ids_json = '[]',
-          current_item = total_items,
-          status_message = ?,
-          completed_at = ?, updated_at = CURRENT_TIMESTAMP
+        SET current_iteration = MAX(current_iteration, ?),
+          status_message = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND status = 'running'
       `).run(
-        `Training complete after ${iteration} iteration${iteration === 1 ? "" : "s"}: every retried PR earned credit`,
-        new Date().toISOString(),
+        iteration,
+        iteration === 0
+          ? `Reviewing PR ${pullRequestId}`
+          : `Retrying PR ${pullRequestId} · ${iteration}/${job.max_iterations}`,
         job.id,
       );
-      return;
+      const preparedSkillRoot = await prepareTrainingSkillSnapshot({
+        jobId: job.id,
+        skill: trainingSkill,
+        pullRequestId,
+        iteration,
+        mutationGate,
+      });
+      const reviewTaskId = await runReview({
+        job,
+        repository: trainingRepository,
+        skill: trainingSkill,
+        pullRequestId,
+        iteration,
+        preparedSkillRoot,
+      });
+      throwIfWorkflowCancelled();
+      const result = readTrainingResult({
+        repository: trainingRepository,
+        skill: trainingSkill,
+        pullRequestId,
+      });
+      if (!result || result.status !== "completed") {
+        throw new Error(
+          `Training review did not complete for PR ${pullRequestId}: ${result?.error ?? result?.status ?? "missing result"}`,
+        );
+      }
+      const score = trainingMetricsScore(result.metrics_json);
+      if (!score) {
+        throw new Error(`Training review produced no score for PR ${pullRequestId}`);
+      }
+      remainingZeroCredit.delete(pullRequestId);
+      updateTrainingHistory(job.id, {
+        pullRequestId,
+        iteration,
+        reviewTaskId,
+        earned: score.earned,
+        available: score.available,
+      });
+      if (score.available === 0 || score.earned > 0) return;
+      remainingZeroCredit.add(pullRequestId);
+      updateProgress();
+      if (iteration === job.max_iterations) return;
+      const analysisJobId = await mutationGate.run(() =>
+        runAnalysis({
+          job,
+          repository: trainingRepository,
+          skill: trainingSkill,
+          pullRequestId,
+          iteration: iteration + 1,
+        }),
+      );
+      throwIfWorkflowCancelled();
+      updateTrainingHistory(job.id, {
+        pullRequestId,
+        iteration,
+        reviewTaskId,
+        analysisJobId,
+        earned: score.earned,
+        available: score.available,
+      });
     }
   }
 
+  async function worker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= pullRequestIds.length) return;
+      const pullRequestId = pullRequestIds[index];
+      active += 1;
+      updateProgress();
+      try {
+        await trainPullRequest(pullRequestId);
+      } catch (error) {
+        throwIfWorkflowCancelled(error);
+        if (isUnavailableModelError(error)) throw error;
+        failures.push(
+          `PR ${pullRequestId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        active -= 1;
+        completed += 1;
+        updateProgress();
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: concurrency }, () => worker()),
+  );
+  throwIfWorkflowCancelled();
+  const statusMessage =
+    failures.length > 0
+      ? `Training complete with ${failures.length} failure${failures.length === 1 ? "" : "s"} and ${remainingZeroCredit.size} zero-credit PR${remainingZeroCredit.size === 1 ? "" : "s"}`
+      : remainingZeroCredit.size > 0
+        ? `Training stopped with ${remainingZeroCredit.size} zero-credit PR${remainingZeroCredit.size === 1 ? "" : "s"} after five retries`
+        : "Training complete: every selected PR earned credit";
   db.prepare(`
     UPDATE skill_training_jobs
-    SET status = 'completed', current_pr_ids_json = ?,
-      current_item = total_items - ?,
-      status_message = ?, completed_at = ?, updated_at = CURRENT_TIMESTAMP
+    SET status = 'completed', current_item = total_items,
+      current_pr_ids_json = ?, status_message = ?, error = ?,
+      completed_at = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ? AND status = 'running'
   `).run(
-    JSON.stringify(zeroCreditIds),
-    zeroCreditIds.length,
-    `Training stopped after ${job.max_iterations} iterations with ${zeroCreditIds.length} zero-credit PR${zeroCreditIds.length === 1 ? "" : "s"} remaining`,
+    JSON.stringify([...remainingZeroCredit]),
+    statusMessage,
+    failures.length > 0 ? failures.join("\n") : null,
     new Date().toISOString(),
     job.id,
   );
@@ -566,6 +634,7 @@ export async function executeSkillTrainingJob(job: SkillTrainingJob) {
       markTrainingCancelled(job.id);
       return;
     }
+    controller.abort();
     throw error;
   } finally {
     clearInterval(cancellationTimer);

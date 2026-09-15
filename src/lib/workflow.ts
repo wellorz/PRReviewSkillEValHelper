@@ -1844,6 +1844,7 @@ async function processNamedSkillEval(
     contextTier: string;
     localRepoPath?: string | null;
     localRepoBranch?: string | null;
+    preparedSkillRoots?: Record<string, string>;
   },
 ) {
   const db = getDb();
@@ -1910,11 +1911,15 @@ async function processNamedSkillEval(
   await Promise.all(
     skills.map(async (skill) => {
       try {
+        const preparedSkillRoot =
+          payload.preparedSkillRoots?.[String(skill.id)];
         preparedSkills.set(skill.id, {
-          root: await prepareSkillRoot(
-            skill.path,
-            path.join(root, `skill-${skill.id}`),
-          ),
+          root:
+            preparedSkillRoot ??
+            (await prepareSkillRoot(
+              skill.path,
+              path.join(root, `skill-${skill.id}`),
+            )),
           error: null,
         });
       } catch (error) {
@@ -2145,6 +2150,7 @@ async function processSkillEval(
     contextTier?: string;
     localRepoPath?: string | null;
     localRepoBranch?: string | null;
+    preparedSkillRoots?: Record<string, string>;
   };
   if (payload.skillIds?.length) {
     if (
@@ -2162,6 +2168,7 @@ async function processSkillEval(
       contextTier: payload.contextTier,
       localRepoPath: payload.localRepoPath,
       localRepoBranch: payload.localRepoBranch,
+      preparedSkillRoots: payload.preparedSkillRoots,
     });
     return;
   }

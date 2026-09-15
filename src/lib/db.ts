@@ -168,6 +168,7 @@ db.exec(`
     error TEXT,
     report_path TEXT,
     training_job_id INTEGER,
+    training_pull_request_id INTEGER,
     training_iteration INTEGER,
     started_at TEXT,
     completed_at TEXT,
@@ -292,6 +293,7 @@ db.exec(`
     status_message TEXT NOT NULL DEFAULT 'Waiting for worker',
     error TEXT,
     training_job_id INTEGER,
+    training_pull_request_id INTEGER,
     training_iteration INTEGER,
     started_at TEXT,
     completed_at TEXT,
@@ -688,6 +690,7 @@ const workflowTaskColumns = db
   .all() as Array<{ name: string }>;
 for (const [name, definition] of [
   ["training_job_id", "INTEGER"],
+  ["training_pull_request_id", "INTEGER"],
   ["training_iteration", "INTEGER"],
 ] as const) {
   if (!workflowTaskColumns.some((column) => column.name === name)) {
@@ -700,6 +703,7 @@ const skillAnalysisJobColumns = db
   .all() as Array<{ name: string }>;
 for (const [name, definition] of [
   ["training_job_id", "INTEGER"],
+  ["training_pull_request_id", "INTEGER"],
   ["training_iteration", "INTEGER"],
 ] as const) {
   if (!skillAnalysisJobColumns.some((column) => column.name === name)) {
@@ -708,11 +712,17 @@ for (const [name, definition] of [
 }
 
 db.exec(`
+  DROP INDEX IF EXISTS idx_workflow_training_iteration;
+  DROP INDEX IF EXISTS idx_analysis_training_iteration;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_training_iteration
-    ON workflow_tasks(training_job_id, training_iteration)
+    ON workflow_tasks(
+      training_job_id, training_pull_request_id, training_iteration
+    )
     WHERE training_job_id IS NOT NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_training_iteration
-    ON skill_analysis_jobs(training_job_id, training_iteration)
+    ON skill_analysis_jobs(
+      training_job_id, training_pull_request_id, training_iteration
+    )
     WHERE training_job_id IS NOT NULL;
 `);
 

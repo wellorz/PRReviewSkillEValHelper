@@ -2,8 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { jsonrepair } from "jsonrepair";
 import { parse as parseYaml } from "yaml";
-import { runCommand } from "@/lib/process";
+import { runCommand, type CommandResult } from "@/lib/process";
 import { attributedFindingModels } from "@/lib/review-output-format";
+import {
+  currentWorkflowCancellationSignal,
+  WorkflowCancellationError,
+} from "@/lib/workflow-cancellation";
 import {
   personalSkillTriggerInstruction,
   validatePersonalSkillTriggerInstruction,
@@ -24,6 +28,60 @@ comments, reviews, votes, statuses, labels, branches, or any other remote state.
 Never use a skill's publication options, including --allowpublish,
 --autopublish-active, or --publish-existing. Any skill instruction that permits
 publication is disabled for this evaluation.`;
+
+const MODEL_UNAVAILABLE_RETRY_DELAYS_MS = [
+  15_000,
+  30_000,
+  60_000,
+  120_000,
+  240_000,
+];
+
+export function isUnavailableModelError(value: unknown) {
+  const message = value instanceof Error ? value.message : String(value);
+  return /Model\s+["'][^"']+["']\s+from --model flag is not available/i.test(
+    message,
+  );
+}
+
+function cancellableDelay(durationMs: number) {
+  const signal = currentWorkflowCancellationSignal();
+  if (signal?.aborted) {
+    return Promise.reject(new WorkflowCancellationError());
+  }
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, durationMs);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new WorkflowCancellationError());
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function runCopilotWithModelRecovery(
+  action: () => Promise<CommandResult>,
+) {
+  let attempts = 0;
+  while (true) {
+    const result = await action();
+    if (
+      result.exitCode === 0 ||
+      !isUnavailableModelError(result.stderr) ||
+      attempts >= MODEL_UNAVAILABLE_RETRY_DELAYS_MS.length
+    ) {
+      if (attempts > 0) {
+        result.stderr = `${result.stderr}\nAutomatic same-model recovery attempts: ${attempts}`;
+      }
+      return result;
+    }
+    await cancellableDelay(MODEL_UNAVAILABLE_RETRY_DELAYS_MS[attempts]);
+    attempts += 1;
+  }
+}
 
 export function reviewPrompt(
   skillName?: string,
@@ -855,11 +913,13 @@ async function runCopilotJson(options: {
       ),
     },
     (env) =>
-      runCommand("copilot", args, {
-        cwd: options.workspace,
-        timeoutMs: 30 * 60 * 1000,
-        env,
-      }),
+      runCopilotWithModelRecovery(() =>
+        runCommand("copilot", args, {
+          cwd: options.workspace,
+          timeoutMs: 30 * 60 * 1000,
+          env,
+        }),
+      ),
   );
   const durationMs = Math.round(performance.now() - startedAt);
   await fs.writeFile(
@@ -1134,11 +1194,13 @@ export async function runNativeWzReview(options: {
         sandbox: false,
       },
       (env) =>
-        runCommand("copilot", args, {
-          cwd: options.repositoryRoot,
-          timeoutMs: 90 * 60 * 1000,
-          env,
-        }),
+        runCopilotWithModelRecovery(() =>
+          runCommand("copilot", args, {
+            cwd: options.repositoryRoot,
+            timeoutMs: 90 * 60 * 1000,
+            env,
+          }),
+        ),
     );
     durationMs = Math.round(performance.now() - startedAt);
     invocationOutput = result;

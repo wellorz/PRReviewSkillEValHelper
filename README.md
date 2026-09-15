@@ -115,12 +115,20 @@ result unit is one named personal skill × one PR.
 10. **Train Personal Skill** requires exactly one selected personal skill. After
     confirmation, the durable local-only workflow reviews all selected PRs,
     analyzes and applies safe mitigations only for PRs earning zero credit, and
-    retries that reduced set. It stops as soon as every retried PR earns credit
-    or after five mitigation-and-retry iterations. While active, **Cancel
-    Training** stops future iterations and aborts the running review or analysis
-    process tree; completed reviews and mitigations already applied remain
-    intact. Per-PR Analyze remains available for investigation, while bulk
-    analyze-and-apply is handled only by training.
+    retries them. Up to the configured review concurrency, each worker advances
+    one PR independently through review, gap analysis, mitigation, and retry,
+    so a worker does not wait for every initial review to finish. Skill
+    snapshot creation and mitigation writes share a one-at-a-time gate, while
+    already-staged PR reviews continue in parallel. Each PR stops as soon as it
+    earns credit or after five retries. While active, **Cancel Training** stops
+    future iterations and aborts the running review or analysis process tree;
+    completed reviews and mitigations already applied remain intact. Per-PR
+    Analyze remains available for investigation, while bulk analyze-and-apply
+    is handled only by training. If Copilot temporarily reports that the
+    configured model is unavailable, review calls retry that exact model after
+    bounded 15, 30, 60, 120, and 240 second delays. Training never silently
+    substitutes a different model, because that would invalidate the recorded
+    comparison.
 
 Skill evaluation requires a completed baseline profile matching **Model 1 +
 Model 2 + the current orchestration context** for every selected PR. This keeps

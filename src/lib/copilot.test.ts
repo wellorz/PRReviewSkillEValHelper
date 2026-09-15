@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   localOnlyCopilotPermissionArgs,
   localOnlySandboxSettings,
+  isUnavailableModelError,
   nativeWzReviewArtifactError,
   nativeWzReviewPrompt,
   nativeReviewerModels,
@@ -21,6 +22,16 @@ import {
   personalSkillTriggerInstruction,
   validatePersonalSkillTriggerInstruction,
 } from "@/lib/personal-skill-trigger";
+
+test("classifies only explicit unavailable-model failures as recoverable", () => {
+  assert.equal(
+    isUnavailableModelError(
+      'Error: Model "gpt-5.4" from --model flag is not available.',
+    ),
+    true,
+  );
+  assert.equal(isUnavailableModelError("Copilot invocation timed out"), false);
+});
 
 test("parses and bounds repository-backed code-reading knowledge", () => {
   const output = parseCodeReadingKnowledgeOutput(
