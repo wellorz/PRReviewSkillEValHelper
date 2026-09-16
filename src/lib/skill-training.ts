@@ -80,7 +80,10 @@ export function trainingMetricsScore(value: string | null) {
   }
 }
 
-export function trainingFailureRecovery(value: unknown) {
+export function trainingFailureRecovery(
+  value: unknown,
+  phase: "review" | "analysis" = "review",
+) {
   const message = value instanceof Error ? value.message : String(value);
   if (isUnavailableModelError(message)) {
     return {
@@ -100,8 +103,14 @@ export function trainingFailureRecovery(value: unknown) {
   }
   if (/Apply stopped:|append-only mitigations/i.test(message)) {
     return {
-      retryDelaysMs: [] as readonly number[],
-      reason: "the append-only mitigation safety gate rejected the edit",
+      retryDelaysMs:
+        phase === "analysis"
+          ? TRANSIENT_TRAINING_RETRY_DELAYS_MS
+          : ([] as readonly number[]),
+      reason:
+        phase === "analysis"
+          ? "the unsafe edit was rejected and the analysis must regenerate an append-only proposal"
+          : "the append-only mitigation safety gate rejected the edit",
     };
   }
   if (/artifacts do not match the requested source and target commits/i.test(message)) {
@@ -332,7 +341,7 @@ async function runReview(options: {
     } catch (error) {
       throwIfWorkflowCancelled(error);
       const message = error instanceof Error ? error.message : String(error);
-      const recovery = trainingFailureRecovery(error);
+      const recovery = trainingFailureRecovery(error, "review");
       const delayMs = recovery.retryDelaysMs[retryCount];
       if (delayMs !== undefined) {
         retryCount += 1;
@@ -500,7 +509,7 @@ async function runAnalysis(options: {
     } catch (error) {
       throwIfWorkflowCancelled(error);
       const message = error instanceof Error ? error.message : String(error);
-      const recovery = trainingFailureRecovery(error);
+      const recovery = trainingFailureRecovery(error, "analysis");
       const delayMs = recovery.retryDelaysMs[retryCount];
       if (delayMs !== undefined) {
         retryCount += 1;
@@ -779,6 +788,7 @@ async function runSkillTrainingJob(job: SkillTrainingJob) {
         await trainPullRequest(pullRequestId);
       } catch (error) {
         throwIfWorkflowCancelled(error);
+        remainingZeroCredit.delete(pullRequestId);
         if (isUnavailableModelError(error)) throw error;
         failures.push(
           `PR ${pullRequestId}: ${error instanceof Error ? error.message : String(error)}`,

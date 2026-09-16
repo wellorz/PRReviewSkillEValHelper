@@ -130,9 +130,10 @@ result unit is one named personal skill × one PR.
     substitutes a different model, because that would invalidate the recorded
     comparison. Other transient review or analysis failures receive up to two
     same-configuration execution retries; timeouts receive one retry. Missing
-    immutable commits, sandbox failures, artifact identity mismatches, and
-    append-only mitigation safety violations remain explicit failures instead
-    of being retried blindly.
+    immutable commits, sandbox failures, and genuine artifact identity
+    mismatches remain explicit failures instead of being retried blindly.
+    Unsafe mitigation edits are never applied; the analysis may regenerate an
+    append-only proposal up to two times before the safety failure is surfaced.
 
 Skill evaluation requires a completed baseline profile matching **Model 1 +
 Model 2 + the current orchestration context** for every selected PR. This keeps

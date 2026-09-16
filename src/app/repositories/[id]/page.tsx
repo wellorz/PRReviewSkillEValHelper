@@ -1008,6 +1008,16 @@ export default function RepositoryWorkspacePage() {
     ) ?? [];
   const activeTrainingJob = activeTrainingJobs[0];
   const latestTrainingJob = data?.skillTrainingJobs[0];
+  const largestTrainingJobSize = Math.max(
+    0,
+    ...(data?.skillTrainingJobs.map((job) => job.total_items) ?? []),
+  );
+  const defaultTrainingProgressJob =
+    activeTrainingJob ??
+    data?.skillTrainingJobs.find(
+      (job) => job.total_items === largestTrainingJobSize,
+    ) ??
+    latestTrainingJob;
   const trainingProgressJob =
     data?.skillTrainingJobs.find(
       (job) => job.id === trainingProgressJobId,
@@ -2413,10 +2423,12 @@ export default function RepositoryWorkspacePage() {
                   className="secondaryButton trainingProgressButton"
                   disabled={!latestTrainingJob}
                   onClick={() =>
-                    setTrainingProgressJobId(latestTrainingJob?.id ?? null)
+                    setTrainingProgressJobId(
+                      defaultTrainingProgressJob?.id ?? null,
+                    )
                   }
                 >
-                  View Progress
+                  View Training Runs
                 </button>
               </div>
             </div>
@@ -3344,6 +3356,25 @@ export default function RepositoryWorkspacePage() {
               </button>
             </header>
             <div className="defectModalBody trainingProgressBody">
+              <label className="trainingRunSelector">
+                <span>Training run</span>
+                <select
+                  value={trainingProgressJob.id}
+                  onChange={(event) =>
+                    setTrainingProgressJobId(Number(event.target.value))
+                  }
+                >
+                  {data?.skillTrainingJobs.map((job) => (
+                    <option key={job.id} value={job.id}>
+                      Job #{job.id} · {job.total_items} PRs · {job.status}
+                    </option>
+                  ))}
+                </select>
+                <small>
+                  Showing all {trainingProgressJob.pr_progress.length} PRs from
+                  job #{trainingProgressJob.id}.
+                </small>
+              </label>
               <div className="tableWrap">
                 <table className="trainingProgressTable">
                   <thead>

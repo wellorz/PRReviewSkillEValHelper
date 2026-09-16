@@ -45,4 +45,11 @@ test("retries transient training failures without retrying deterministic safety 
     ).retryDelaysMs,
     [],
   );
+  assert.deepEqual(
+    trainingFailureRecovery(
+      "Apply stopped: SKILL.md contains a replacement or removal",
+      "analysis",
+    ).retryDelaysMs,
+    [15_000, 60_000],
+  );
 });

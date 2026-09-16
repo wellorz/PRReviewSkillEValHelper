@@ -231,6 +231,18 @@ test("rejects native wzReview artifacts for different commits", () => {
     ),
     true,
   );
+  assert.equal(
+    nativeWzReviewSourceMatches(
+      {
+        source: {
+          value: "source",
+          requestedBase: "target",
+        },
+      },
+      { sourceCommit: "source", targetCommit: "target" },
+    ),
+    true,
+  );
 });
 
 test("keeps baseline and personal-skill reviews permanently local", () => {

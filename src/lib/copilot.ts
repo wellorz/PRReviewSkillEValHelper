@@ -1127,12 +1127,22 @@ export function nativeWzReviewSourceMatches(
     diffOnly?: boolean;
   },
 ) {
+  const nestedSource =
+    source.source &&
+    typeof source.source === "object" &&
+    !Array.isArray(source.source)
+      ? (source.source as Record<string, unknown>)
+      : source;
+  const headSha = nestedSource.headSha ?? nestedSource.value;
+  const baseSha =
+    nestedSource.baseSha ??
+    nestedSource.requestedBase ??
+    nestedSource.baseInput;
   return (
     options.diffOnly ||
     !options.sourceCommit ||
     !options.targetCommit ||
-    (source.headSha === options.sourceCommit &&
-      source.baseSha === options.targetCommit)
+    (headSha === options.sourceCommit && baseSha === options.targetCommit)
   );
 }
 

@@ -1667,6 +1667,25 @@ footer {
   display: block;
 }
 
+.trainingRunSelector {
+  display: grid;
+  grid-template-columns: auto minmax(240px, 420px) 1fr;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.trainingRunSelector select {
+  min-height: 38px;
+}
+
+.trainingRunSelector small {
+  font-weight: 700;
+}
+
 .trainingProgressTable th,
 .trainingProgressTable td {
   vertical-align: top;
@@ -1687,6 +1706,12 @@ footer {
   margin-top: 4px;
   color: var(--danger);
   white-space: normal;
+}
+
+@media (max-width: 700px) {
+  .trainingRunSelector {
+    grid-template-columns: 1fr;
+  }
 }
 
 .reviewConcurrency {

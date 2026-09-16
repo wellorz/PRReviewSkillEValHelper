@@ -38,8 +38,9 @@ Each PR receives at most five mitigation/review retries. Configured-model
 unavailability uses bounded same-model delays. Transient service, output,
 filesystem, and analysis failures receive up to two same-configuration
 execution retries; timeouts receive one. Missing immutable commits, sandbox
-failures, artifact identity mismatches, and append-only mitigation safety
-violations remain explicit without blind retries. Cancellation or exhausted
+failures, and genuine artifact identity mismatches remain explicit without
+blind retries. Unsafe mitigation edits are never applied; analysis may
+regenerate an append-only proposal up to two times. Cancellation or exhausted
 retries hand control to the user while retaining completed reviews, backups,
 and already-applied mitigations.
 
