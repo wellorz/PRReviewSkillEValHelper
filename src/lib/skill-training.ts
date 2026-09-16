@@ -56,6 +56,9 @@ type TrainingResult = {
   error: string | null;
 };
 
+const TRANSIENT_TRAINING_RETRY_DELAYS_MS = [15_000, 60_000] as const;
+const TIMEOUT_TRAINING_RETRY_DELAYS_MS = [30_000] as const;
+
 function parseIds(value: string) {
   return [...new Set(JSON.parse(value) as number[])];
 }
@@ -74,6 +77,81 @@ export function trainingMetricsScore(value: string | null) {
     };
   } catch {
     return null;
+  }
+}
+
+export function trainingFailureRecovery(value: unknown) {
+  const message = value instanceof Error ? value.message : String(value);
+  if (isUnavailableModelError(message)) {
+    return {
+      retryDelaysMs: [] as readonly number[],
+      reason: "configured-model retries were already exhausted",
+    };
+  }
+  if (
+    /PR head commit .* (?:is unavailable|is not available)|no local ref contains a verified/i.test(
+      message,
+    )
+  ) {
+    return {
+      retryDelaysMs: [] as readonly number[],
+      reason: "the immutable repository commit is unavailable",
+    };
+  }
+  if (/Apply stopped:|append-only mitigations/i.test(message)) {
+    return {
+      retryDelaysMs: [] as readonly number[],
+      reason: "the append-only mitigation safety gate rejected the edit",
+    };
+  }
+  if (/artifacts do not match the requested source and target commits/i.test(message)) {
+    return {
+      retryDelaysMs: [] as readonly number[],
+      reason: "the generated artifacts do not match the immutable review input",
+    };
+  }
+  if (
+    /sandbox(?:ing)?.*(?:unsupported|not supported)|requires BaseContainer/i.test(
+      message,
+    )
+  ) {
+    return {
+      retryDelaysMs: [] as readonly number[],
+      reason: "the required review sandbox is unavailable",
+    };
+  }
+  if (/timed out after \d+ms|timeout/i.test(message)) {
+    return {
+      retryDelaysMs: TIMEOUT_TRAINING_RETRY_DELAYS_MS,
+      reason: "the review or analysis timed out",
+    };
+  }
+  if (
+    /\b400 Bad Request\b|\b408 Request Timeout\b|\b409 Conflict\b|\b425 Too Early\b|\b429 Too Many Requests\b|\b5\d\d\b|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up|network error|temporarily unavailable|failed to delete|Permission denied|\bEPERM\b|\bEBUSY\b|Bad control character in string literal in JSON|JSON at position|Unexpected token .*JSON/i.test(
+      message,
+    )
+  ) {
+    return {
+      retryDelaysMs: TRANSIENT_TRAINING_RETRY_DELAYS_MS,
+      reason: "a transient service, output, or filesystem failure occurred",
+    };
+  }
+  return {
+    retryDelaysMs: [] as readonly number[],
+    reason: "the failure is not classified as safely retryable",
+  };
+}
+
+async function waitForTrainingRetry(jobId: number, delayMs: number) {
+  let remaining = delayMs;
+  while (remaining > 0) {
+    throwIfWorkflowCancelled();
+    if (trainingCancellationRequested(jobId)) {
+      throw new WorkflowCancellationError();
+    }
+    const waitMs = Math.min(remaining, 500);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    remaining -= waitMs;
   }
 }
 
@@ -169,13 +247,18 @@ async function runReview(options: {
   const db = getDb();
   let task = db
     .prepare(`
-      SELECT id, repository_id, kind, pr_ids_json, payload_json, status
+      SELECT id, repository_id, kind, pr_ids_json, payload_json, status,
+        error, training_retry_count
       FROM workflow_tasks
       WHERE training_job_id = ? AND training_pull_request_id = ?
         AND training_iteration = ?
     `)
     .get(options.job.id, options.pullRequestId, options.iteration) as
-    | (WorkflowTask & { status: string })
+    | (WorkflowTask & {
+        status: string;
+        error: string | null;
+        training_retry_count: number;
+      })
     | undefined;
   if (!task) {
     const payload = {
@@ -226,31 +309,88 @@ async function runReview(options: {
       pr_ids_json: JSON.stringify([options.pullRequestId]),
       payload_json: JSON.stringify(payload),
       status: "running",
+      error: null,
+      training_retry_count: 0,
     };
   }
   if (task.status === "completed") return task.id;
   if (task.status === "failed" || task.status === "cancelled") {
-    throw new Error(`Training review task ${task.id} ${task.status}`);
+    throw new Error(
+      task.error ?? `Training review task ${task.id} ${task.status}`,
+    );
   }
-  db.prepare(`
-    UPDATE workflow_tasks SET status = 'running', error = NULL WHERE id = ?
-  `).run(task.id);
-  try {
-    await executeWorkflowTask(task);
-  } catch (error) {
+  let retryCount = task.training_retry_count;
+  for (;;) {
     db.prepare(`
       UPDATE workflow_tasks
-      SET status = 'failed', status_message = 'Training review failed',
-        error = ?, completed_at = ?
-      WHERE id = ? AND status NOT IN ('cancelling', 'cancelled')
-    `).run(
-      error instanceof Error ? error.message : String(error),
-      new Date().toISOString(),
-      task.id,
-    );
-    throw error;
+      SET status = 'running', error = NULL, completed_at = NULL
+      WHERE id = ?
+    `).run(task.id);
+    try {
+      await executeWorkflowTask(task);
+      return task.id;
+    } catch (error) {
+      throwIfWorkflowCancelled(error);
+      const message = error instanceof Error ? error.message : String(error);
+      const recovery = trainingFailureRecovery(error);
+      const delayMs = recovery.retryDelaysMs[retryCount];
+      if (delayMs !== undefined) {
+        retryCount += 1;
+        const retryMessage =
+          `Automatic review retry ${retryCount}/${recovery.retryDelaysMs.length} ` +
+          `for PR ${options.pullRequestId} in ${Math.ceil(delayMs / 1000)}s · ${recovery.reason}`;
+        db.transaction(() => {
+          queuePersonalSkillResults(db, {
+            skillIds: [options.skill.id],
+            pullRequestIds: [options.pullRequestId],
+            model: options.repository.model,
+            modelSecondary: options.repository.model_secondary,
+            contextTier: options.repository.context_tier,
+          });
+          db.prepare(`
+            UPDATE workflow_tasks
+            SET status = 'running', current_item = 0, status_message = ?,
+              error = NULL, completed_at = NULL, training_retry_count = ?
+            WHERE id = ?
+          `).run(retryMessage, retryCount, task.id);
+          db.prepare(`
+            UPDATE skill_training_jobs
+            SET status_message = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'running'
+          `).run(retryMessage, options.job.id);
+        })();
+        await waitForTrainingRetry(options.job.id, delayMs);
+        const runningMessage =
+          `Automatic review retry ${retryCount}/${recovery.retryDelaysMs.length} ` +
+          `for PR ${options.pullRequestId} · ${recovery.reason}`;
+        db.prepare(`
+          UPDATE workflow_tasks SET status_message = ? WHERE id = ?
+        `).run(runningMessage, task.id);
+        db.prepare(`
+          UPDATE skill_training_jobs
+          SET status_message = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND status = 'running'
+        `).run(runningMessage, options.job.id);
+        continue;
+      }
+      const finalMessage =
+        retryCount > 0
+          ? `${message}\nAutomatic execution retries performed: ${retryCount}. Final classification: ${recovery.reason}.`
+          : message;
+      db.prepare(`
+        UPDATE workflow_tasks
+        SET status = 'failed', status_message = 'Training review failed',
+          error = ?, completed_at = ?, training_retry_count = ?
+        WHERE id = ? AND status NOT IN ('cancelling', 'cancelled')
+      `).run(
+        finalMessage,
+        new Date().toISOString(),
+        retryCount,
+        task.id,
+      );
+      throw new Error(finalMessage);
+    }
   }
-  return task.id;
 }
 
 async function runAnalysis(options: {
@@ -265,13 +405,17 @@ async function runAnalysis(options: {
   let analysisJob = db
     .prepare(`
       SELECT id, repository_id, skill_id, mode, model, model_secondary,
-        context_tier, pr_ids_json, status, error
+        context_tier, pr_ids_json, status, error, training_retry_count
       FROM skill_analysis_jobs
       WHERE training_job_id = ? AND training_pull_request_id = ?
         AND training_iteration = ?
     `)
     .get(options.job.id, options.pullRequestId, options.iteration) as
-    | (SkillAnalysisJob & { status: string; error: string | null })
+    | (SkillAnalysisJob & {
+        status: string;
+        error: string | null;
+        training_retry_count: number;
+      })
     | undefined;
   if (!analysisJob) {
     const analysisJobId = db.transaction(() => {
@@ -327,6 +471,7 @@ async function runAnalysis(options: {
       pr_ids_json: JSON.stringify([options.pullRequestId]),
       status: "running",
       error: null,
+      training_retry_count: 0,
     };
   }
   if (analysisJob.status === "completed") {
@@ -338,29 +483,90 @@ async function runAnalysis(options: {
       analysisJob.error ?? `Training analysis ${analysisJob.status}`,
     );
   }
-  db.prepare(`
-    UPDATE skill_analysis_jobs SET status = 'running', error = NULL WHERE id = ?
-  `).run(analysisJob.id);
-  try {
-    await executeSkillAnalysisJob(analysisJob);
-  } catch (error) {
+  let retryCount = analysisJob.training_retry_count;
+  for (;;) {
     db.prepare(`
       UPDATE skill_analysis_jobs
-      SET status = 'failed', status_message = 'Training analysis failed',
-        error = ?, completed_at = ?
-      WHERE id = ? AND status NOT IN ('cancelling', 'cancelled')
-    `).run(
-      error instanceof Error ? error.message : String(error),
-      new Date().toISOString(),
-      analysisJob.id,
-    );
-    throw error;
+      SET status = 'running', error = NULL, completed_at = NULL
+      WHERE id = ?
+    `).run(analysisJob.id);
+    try {
+      await executeSkillAnalysisJob(analysisJob);
+      const completed = db
+        .prepare("SELECT error FROM skill_analysis_jobs WHERE id = ?")
+        .get(analysisJob.id) as { error: string | null } | undefined;
+      if (completed?.error) throw new Error(completed.error);
+      return analysisJob.id;
+    } catch (error) {
+      throwIfWorkflowCancelled(error);
+      const message = error instanceof Error ? error.message : String(error);
+      const recovery = trainingFailureRecovery(error);
+      const delayMs = recovery.retryDelaysMs[retryCount];
+      if (delayMs !== undefined) {
+        retryCount += 1;
+        const retryMessage =
+          `Automatic analysis retry ${retryCount}/${recovery.retryDelaysMs.length} ` +
+          `for PR ${options.pullRequestId} in ${Math.ceil(delayMs / 1000)}s · ${recovery.reason}`;
+        db.transaction(() => {
+          db.prepare(`
+            UPDATE skill_analysis_results
+            SET status = 'pending', duration_ms = NULL, analysis_json = NULL,
+              proposal_json = NULL, usage_json = NULL, raw_output = NULL,
+              error = NULL, applied_at = NULL, application_error = NULL,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE skill_id = ? AND pull_request_id = ?
+              AND model = ? AND model_secondary = ? AND context_tier = ?
+          `).run(
+            options.skill.id,
+            options.pullRequestId,
+            configuration.model,
+            configuration.modelSecondary,
+            configuration.contextTier,
+          );
+          db.prepare(`
+            UPDATE skill_analysis_jobs
+            SET status = 'running', current_item = 0, status_message = ?,
+              error = NULL, completed_at = NULL, training_retry_count = ?
+            WHERE id = ?
+          `).run(retryMessage, retryCount, analysisJob.id);
+          db.prepare(`
+            UPDATE skill_training_jobs
+            SET status_message = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'running'
+          `).run(retryMessage, options.job.id);
+        })();
+        await waitForTrainingRetry(options.job.id, delayMs);
+        const runningMessage =
+          `Automatic analysis retry ${retryCount}/${recovery.retryDelaysMs.length} ` +
+          `for PR ${options.pullRequestId} · ${recovery.reason}`;
+        db.prepare(`
+          UPDATE skill_analysis_jobs SET status_message = ? WHERE id = ?
+        `).run(runningMessage, analysisJob.id);
+        db.prepare(`
+          UPDATE skill_training_jobs
+          SET status_message = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND status = 'running'
+        `).run(runningMessage, options.job.id);
+        continue;
+      }
+      const finalMessage =
+        retryCount > 0
+          ? `${message}\nAutomatic execution retries performed: ${retryCount}. Final classification: ${recovery.reason}.`
+          : message;
+      db.prepare(`
+        UPDATE skill_analysis_jobs
+        SET status = 'failed', status_message = 'Training analysis failed',
+          error = ?, completed_at = ?, training_retry_count = ?
+        WHERE id = ? AND status NOT IN ('cancelling', 'cancelled')
+      `).run(
+        finalMessage,
+        new Date().toISOString(),
+        retryCount,
+        analysisJob.id,
+      );
+      throw new Error(finalMessage);
+    }
   }
-  const completed = db
-    .prepare("SELECT error FROM skill_analysis_jobs WHERE id = ?")
-    .get(analysisJob.id) as { error: string | null } | undefined;
-  if (completed?.error) throw new Error(completed.error);
-  return analysisJob.id;
 }
 
 function trainingCancellationRequested(jobId: number) {

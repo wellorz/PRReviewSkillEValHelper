@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { trainingMetricsScore } from "@/lib/skill-training";
+import {
+  trainingFailureRecovery,
+  trainingMetricsScore,
+} from "@/lib/skill-training";
 
 test("identifies zero-credit training results without treating invalid scores as zero", () => {
   assert.deepEqual(
@@ -17,4 +20,29 @@ test("identifies zero-credit training results without treating invalid scores as
   );
   assert.equal(trainingMetricsScore(null), null);
   assert.equal(trainingMetricsScore("{invalid"), null);
+});
+
+test("retries transient training failures without retrying deterministic safety failures", () => {
+  assert.deepEqual(
+    trainingFailureRecovery(
+      "Execution failed: 400 Bad Request (Request ID: transient)",
+    ).retryDelaysMs,
+    [15_000, 60_000],
+  );
+  assert.deepEqual(
+    trainingFailureRecovery("copilot timed out after 5400000ms").retryDelaysMs,
+    [30_000],
+  );
+  assert.deepEqual(
+    trainingFailureRecovery(
+      "PR head commit abc is unavailable, and no local ref contains a verified commit",
+    ).retryDelaysMs,
+    [],
+  );
+  assert.deepEqual(
+    trainingFailureRecovery(
+      "Apply stopped: SKILL.md contains a replacement or removal",
+    ).retryDelaysMs,
+    [],
+  );
 });

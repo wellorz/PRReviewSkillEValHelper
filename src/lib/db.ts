@@ -170,6 +170,7 @@ db.exec(`
     training_job_id INTEGER,
     training_pull_request_id INTEGER,
     training_iteration INTEGER,
+    training_retry_count INTEGER NOT NULL DEFAULT 0,
     started_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -295,6 +296,7 @@ db.exec(`
     training_job_id INTEGER,
     training_pull_request_id INTEGER,
     training_iteration INTEGER,
+    training_retry_count INTEGER NOT NULL DEFAULT 0,
     started_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -692,6 +694,7 @@ for (const [name, definition] of [
   ["training_job_id", "INTEGER"],
   ["training_pull_request_id", "INTEGER"],
   ["training_iteration", "INTEGER"],
+  ["training_retry_count", "INTEGER NOT NULL DEFAULT 0"],
 ] as const) {
   if (!workflowTaskColumns.some((column) => column.name === name)) {
     db.exec(`ALTER TABLE workflow_tasks ADD COLUMN ${name} ${definition}`);
@@ -705,6 +708,7 @@ for (const [name, definition] of [
   ["training_job_id", "INTEGER"],
   ["training_pull_request_id", "INTEGER"],
   ["training_iteration", "INTEGER"],
+  ["training_retry_count", "INTEGER NOT NULL DEFAULT 0"],
 ] as const) {
   if (!skillAnalysisJobColumns.some((column) => column.name === name)) {
     db.exec(`ALTER TABLE skill_analysis_jobs ADD COLUMN ${name} ${definition}`);

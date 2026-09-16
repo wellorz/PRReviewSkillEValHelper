@@ -92,15 +92,6 @@ db.prepare(
 db.prepare(
   "UPDATE skill_training_jobs SET status = 'queued', status_message = 'Recovered interrupted training', error = NULL WHERE status = 'running'",
 ).run();
-db.prepare(`
-  UPDATE skill_training_jobs
-  SET status = 'queued',
-    status_message = 'Retrying after configured model became unavailable',
-    error = NULL, completed_at = NULL, updated_at = CURRENT_TIMESTAMP
-  WHERE status = 'failed'
-    AND error LIKE '%from --model flag is not available%'
-`).run();
-
 function errorDetails(error: unknown) {
   if (!(error instanceof Error)) return String(error);
   return error.stack && !error.stack.startsWith(error.message)

@@ -452,7 +452,8 @@ export async function GET(
     const prIds = numericIds(training.pr_ids_json);
     const reviewTasks = db
       .prepare(`
-        SELECT id, status, pr_ids_json, training_iteration
+        SELECT id, status, status_message, pr_ids_json, training_iteration,
+          training_retry_count
         FROM workflow_tasks
         WHERE training_job_id = ?
         ORDER BY training_iteration ASC
@@ -460,12 +461,15 @@ export async function GET(
       .all(training.id) as Array<{
       id: number;
       status: string;
+      status_message: string;
       pr_ids_json: string;
       training_iteration: number;
+      training_retry_count: number;
     }>;
     const analysisTasks = db
       .prepare(`
-        SELECT id, status, pr_ids_json, training_iteration
+        SELECT id, status, status_message, pr_ids_json, training_iteration,
+          training_retry_count
         FROM skill_analysis_jobs
         WHERE training_job_id = ?
         ORDER BY training_iteration ASC
@@ -473,8 +477,10 @@ export async function GET(
       .all(training.id) as Array<{
       id: number;
       status: string;
+      status_message: string;
       pr_ids_json: string;
       training_iteration: number;
+      training_retry_count: number;
     }>;
     const resultRows =
       prIds.length === 0
@@ -542,8 +548,11 @@ export async function GET(
               ? "Zero credit"
               : "Earned credit";
         } else if (reviewAttempt) {
-          reviewStatus =
-            reviewAttempt.training_iteration > 0 ? "Retrying review" : "Reviewing";
+          reviewStatus = reviewAttempt.status_message.startsWith("Automatic ")
+            ? reviewAttempt.status_message
+            : reviewAttempt.training_iteration > 0
+              ? "Retrying review"
+              : "Reviewing";
         } else if (training.status === "completed") {
           reviewStatus = "Training complete";
         } else if (latestResult?.status) {
@@ -555,9 +564,21 @@ export async function GET(
           number: pullRequest?.number ?? pullRequestId,
           title: pullRequest?.title ?? "Unknown PR",
           status: reviewStatus,
-          retries: reviewAttempts.filter(
-            (task) => task.training_iteration > 0,
-          ).length,
+          retries:
+            reviewAttempts.filter((task) => task.training_iteration > 0)
+              .length +
+            reviewAttempts.reduce(
+              (sum, task) => sum + task.training_retry_count,
+              0,
+            ) +
+            analysisTasks
+              .filter((task) =>
+                numericIds(task.pr_ids_json).includes(pullRequestId),
+              )
+              .reduce(
+                (sum, task) => sum + task.training_retry_count,
+                0,
+              ),
           earned: score?.earned ?? null,
           available: score?.available ?? null,
           error: latestResult?.error ?? null,

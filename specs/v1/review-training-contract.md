@@ -35,7 +35,11 @@ Generated CodeReading graphs are evidence, never mitigation targets.
 ## Retry and handoff
 
 Each PR receives at most five mitigation/review retries. Configured-model
-unavailability uses bounded same-model delays. Cancellation or exhausted
+unavailability uses bounded same-model delays. Transient service, output,
+filesystem, and analysis failures receive up to two same-configuration
+execution retries; timeouts receive one. Missing immutable commits, sandbox
+failures, artifact identity mismatches, and append-only mitigation safety
+violations remain explicit without blind retries. Cancellation or exhausted
 retries hand control to the user while retaining completed reviews, backups,
 and already-applied mitigations.
 
